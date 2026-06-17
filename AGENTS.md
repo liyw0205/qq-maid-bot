@@ -43,7 +43,7 @@ Rust HTTP 层只公开：
 ## 工作方式
 
 * 默认做小改动，保持用户可见行为稳定。
-* 修改前先读相关 README、Makefile、`.env.example` 和邻近源码。
+* 修改前先读相关 README、Makefile、`runtime/.env.example` 和邻近源码。
 * 不确定的内容标注“当前未发现 / 需确认”，不要编造。
 * 不要未经要求重写架构、迁移运行路径或引入大依赖。
 * 不要把具体人设、群聊内容、真实用户信息或业务材料写死进代码。
@@ -191,7 +191,7 @@ make diagnose
 环境变量模板在：
 
 ```text
-.env.example
+runtime/.env.example
 ```
 
 不要读取、打印或提交真实 `.env`。
@@ -244,7 +244,7 @@ commit message 使用简洁中文：
 
 修改前：
 
-* 先查看 README、Makefile、`.env.example` 和相关源码。
+* 先查看 README、Makefile、`runtime/.env.example` 和相关源码。
 * 检查工作区已有改动，不要回滚无关用户修改。
 * 搜索现有实现，优先复用已有代码。
 * 检查相关代码附近是否存在说明业务约束或设计原因的注释。

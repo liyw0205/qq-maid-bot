@@ -30,13 +30,13 @@ qq-maid-llm RSS scheduler
 
 ## 配置
 
-复制模板并填入真实配置：
+从仓库根目录复制模板并填入真实配置：
 
 ```bash
-cp .env.example .env
+cp runtime/.env.example runtime/config/.env
 ```
 
-如需只给 gateway 保留局部配置，也兼容 `qq-maid-gateway-rs/config/.env`。
+默认配置入口位于运行目录，优先读取 `runtime/config/.env`，其次读取 `runtime/.env`；临时排障可用 `GATEWAY_ENV_FILE` 指向单独配置文件。
 
 主要变量：
 
@@ -64,11 +64,11 @@ QQ_APPID=你的QQ机器人AppID
 QQ_SECRET=你的QQ机器人AppSecret
 ```
 
-不要提交真实 `.env`、AppSecret、Access Token、openid、私聊内容或截图中的敏感信息。
+不要提交真实配置文件、AppSecret、Access Token、openid、私聊内容或截图中的敏感信息。
 
 ## 日志
 
-默认日志级别为 `info,qq_maid_gateway_rs=debug`，可写在仓库根 `.env`：
+默认日志级别为 `info,qq_maid_gateway_rs=debug`，可写在运行目录配置：
 
 ```env
 RUST_LOG=info,qq_maid_gateway_rs=debug
@@ -88,7 +88,7 @@ RUST_LOG=debug make run-gateway
 QQ_MAID_GATEWAY_VERBOSE_LOG=true make run-gateway
 ```
 
-也可以写入 `.env`：
+也可以写入 `runtime/config/.env`：
 
 ```env
 QQ_MAID_GATEWAY_VERBOSE_LOG=true

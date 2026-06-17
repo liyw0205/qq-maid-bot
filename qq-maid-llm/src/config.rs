@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn env_example_documents_rss_summary_limit_default() {
-        let env_example = include_str!("../../.env.example");
+        let env_example = include_str!("../../runtime/.env.example");
 
         assert!(env_example.contains("RSS_SUMMARY_MAX_CHARS=500"));
     }
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn env_example_documents_optional_world_file() {
-        let env_example = include_str!("../../.env.example");
+        let env_example = include_str!("../../runtime/.env.example");
 
         assert!(env_example.contains("WORLD_FILE="));
     }

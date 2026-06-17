@@ -37,10 +37,10 @@ diagnose:
 	bash scripts/diagnose-network.sh
 
 run-llm:
-	cargo run -p qq-maid-llm
+	cd runtime && cargo run --manifest-path ../Cargo.toml -p qq-maid-llm
 
 run-gateway:
-	cargo run -p qq-maid-gateway-rs
+	cd runtime && cargo run --manifest-path ../Cargo.toml -p qq-maid-gateway-rs
 
 build-llm:
 	cargo build --release -p qq-maid-llm

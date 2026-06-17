@@ -46,10 +46,8 @@ resolve_env_file() {
 
     local candidate
     for candidate in \
-        "${REPO_DIR}/.env" \
-        "${RUNTIME_DIR}/.env" \
         "${RUNTIME_DIR}/config/.env" \
-        "${REPO_DIR}/qq-maid-llm/config/.env"
+        "${RUNTIME_DIR}/.env"
     do
         if [[ -f "${candidate}" ]]; then
             echo "${candidate}"

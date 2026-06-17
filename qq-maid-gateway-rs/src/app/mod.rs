@@ -29,6 +29,8 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 /// 依次尝试加载当前工作目录下的 `config/.env` 和 `.env` 文件。
+/// 本地 make 目标和部署控制脚本都会先切到 `runtime/`，因此默认对应
+/// `runtime/config/.env` 和 `runtime/.env`，避免继续读取仓库根配置。
 ///
 /// `dotenvy` 默认不覆盖已经存在的环境变量：进程环境变量优先，
 /// 且先加载的 dotenv 文件会保留同名变量，后续文件只补充缺失项。

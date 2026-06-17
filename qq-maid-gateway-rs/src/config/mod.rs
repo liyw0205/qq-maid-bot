@@ -40,8 +40,8 @@ pub enum ConfigError {
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        // dotenvy 不覆盖已存在变量；这里保留兼容加载，避免测试或独立调用
-        // `from_env` 时依赖启动入口完成初始化。
+        // 独立调用 from_env 时也只按当前运行目录加载配置：
+        // 先 config/.env，再 .env，保持与启动入口一致。
         let _ = dotenvy::from_path("config/.env");
         let _ = dotenvy::dotenv();
         let env = std::env::vars().collect::<HashMap<_, _>>();

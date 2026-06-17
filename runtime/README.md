@@ -1,19 +1,21 @@
 # runtime/ — 服务器运行配置目录
 
 本目录是服务器运行目录示例，部署后会放置 release 二进制、控制脚本和运行期配置。真实 `.env`、成员映射、世界观和提示词都属于本地私有配置；
-仓库只保留 `.example` 模板，用于说明字段含义。生产部署可以通过 `.env` 把路径指向外部私有配置仓库或本机私有目录。
+仓库只保留 `.example` 模板，用于说明字段含义。生产部署可以通过 `runtime/config/.env` 或 `runtime/.env` 把路径指向外部私有配置仓库或本机私有目录。
 
 ## 目录结构
 
 ```
 runtime/
-├── .env                             # 环境变量（QQ 机器人、LLM 供应商、服务端口）
+├── .env.example                     # 可提交的环境变量模板
+├── .env                             # 兼容环境变量文件，不提交
 ├── qq-maid-llm                      # 部署后的 Rust LLM release 二进制，不提交
 ├── qq-maid-gateway-rs               # 部署后的 Rust gateway release 二进制，不提交
 ├── llmctl.sh                        # 部署后的 LLM 控制脚本，不提交
 ├── gatewayctl.sh                    # 部署后的 gateway 控制脚本，不提交
 ├── README.md                        # 本文件
 └── config/
+    ├── .env                         # 推荐真实环境变量文件，不提交
     ├── world.example.md             # 可提交的 WORLD_FILE 模板
     ├── world.md                     # 可选世界观文件，路径由 WORLD_FILE 指定，不提交
     ├── member_id_mapping.example.json
@@ -27,9 +29,15 @@ runtime/
 
 ## 各文件说明
 
-### `.env`
+### `config/.env` / `.env`
 
-全局环境变量。控制 QQ Bot SDK 参数、LLM 供应商（OpenAI / DeepSeek）、LLM 服务监听地址、超时和外部配置路径等。
+全局环境变量。控制 QQ Bot SDK 参数、LLM 供应商（OpenAI / DeepSeek）、LLM 服务监听地址、超时和外部配置路径等。首次配置推荐从仓库根目录执行：
+
+```bash
+cp runtime/.env.example runtime/config/.env
+```
+
+控制脚本默认先读取 `runtime/config/.env`，再读取 `runtime/.env`；显式 `LLM_ENV_FILE` / `GATEWAY_ENV_FILE` 会覆盖默认查找。
 **注意：包含密钥，不要提交到公开仓库。**
 
 和私有配置仓库相关的常用路径变量：
@@ -56,7 +64,7 @@ runtime/
 
 ### `config/world.md`
 
-可选世界观或角色设定提示词。正式入口是 `.env` 中的 `WORLD_FILE`，不再要求把世界观固定写入
+可选世界观或角色设定提示词。正式入口是运行目录配置中的 `WORLD_FILE`，不再要求把世界观固定写入
 `PROMPT_DIR/innerworld_lore.md`。未配置 `WORLD_FILE` 时按通用助手运行；一旦配置，文件必须存在、可读且非空。
 
 开源前如果曾提交过真实世界观，需要额外清理 Git 历史；单纯从当前 HEAD 删除不能移除历史记录。
@@ -83,7 +91,7 @@ runtime/
 ## 联动关系
 
 ```
-.env (供应商/密钥)
+runtime/config/.env 或 runtime/.env (供应商/密钥)
   └→ Rust LLM Server (127.0.0.1:8787)
        └→ /v1/respond 接口
             └→ 组装 system prompt:
@@ -92,4 +100,4 @@ runtime/
                  + member_id_mapping.json (注入为成员信息)
 ```
 
-运行前可按 `.example` 模板复制为无 `.example` 后缀的本地文件，也可以直接把 `.env` 中的路径变量指向外部私有配置仓库。Secret、数据库、日志和聊天记录不应进入任何 Git 仓库；真实 prompt、世界观和成员映射只应放在私有配置仓库或本地私有目录，不进入公开仓库。
+运行前可按 `.example` 模板复制为无 `.example` 后缀的本地文件，也可以直接把运行目录配置中的路径变量指向外部私有配置仓库。Secret、数据库、日志和聊天记录不应进入任何 Git 仓库；真实 prompt、世界观和成员映射只应放在私有配置仓库或本地私有目录，不进入公开仓库。
