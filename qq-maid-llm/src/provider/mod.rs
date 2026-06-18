@@ -55,12 +55,9 @@ pub type DynLlmProvider = Arc<dyn LlmProvider>;
 pub fn build_provider(config: &AppConfig) -> Result<DynLlmProvider, LlmError> {
     match config.provider {
         ProviderMode::OpenAi => {
-            ensure_route_supported(
-                &config.model_route,
-                ModelProvider::OpenAi,
-                ModelProvider::OpenAi,
-                "LLM_MODEL",
-            )?;
+            for (name, route) in config.configured_model_routes()? {
+                ensure_route_supported(&route, ModelProvider::OpenAi, ModelProvider::OpenAi, name)?;
+            }
             let provider: DynLlmProvider = Arc::new(openai::OpenAiRigProvider::new(config)?);
             Ok(Arc::new(ModelRouteProvider::new(
                 "openai",
@@ -70,12 +67,14 @@ pub fn build_provider(config: &AppConfig) -> Result<DynLlmProvider, LlmError> {
             )?))
         }
         ProviderMode::DeepSeek => {
-            ensure_route_supported(
-                &config.model_route,
-                ModelProvider::DeepSeek,
-                ModelProvider::DeepSeek,
-                "LLM_MODEL",
-            )?;
+            for (name, route) in config.configured_model_routes()? {
+                ensure_route_supported(
+                    &route,
+                    ModelProvider::DeepSeek,
+                    ModelProvider::DeepSeek,
+                    name,
+                )?;
+            }
             let provider: DynLlmProvider = Arc::new(deepseek::DeepSeekRigProvider::new(config)?);
             Ok(Arc::new(ModelRouteProvider::new(
                 "deepseek",
@@ -86,29 +85,26 @@ pub fn build_provider(config: &AppConfig) -> Result<DynLlmProvider, LlmError> {
         }
         ProviderMode::Auto => {
             let route = auto_default_route(config)?;
+            let provider_routes = auto_provider_routes(config, &route)?;
+            let required_providers =
+                provider_kinds_for_routes(&provider_routes, ModelProvider::OpenAi);
             let mut providers: Vec<(ModelProvider, DynLlmProvider)> = Vec::new();
 
-            if route_uses_provider(&route, ModelProvider::OpenAi, ModelProvider::OpenAi) {
-                providers.push((
-                    ModelProvider::OpenAi,
-                    Arc::new(openai::OpenAiRigProvider::new(config)?),
-                ));
+            if required_providers.contains(&ModelProvider::DeepSeek) {
+                ensure_deepseek_api_key_for_routes(config, &provider_routes)?;
             }
-            if route_uses_provider(&route, ModelProvider::DeepSeek, ModelProvider::OpenAi) {
-                let provider = config.deepseek_api_key.as_ref().ok_or_else(|| {
-                    LlmError::config(
-                        "DEEPSEEK_API_KEY is required because model route includes DeepSeek",
-                    )
-                })?;
-                if provider.trim().is_empty() {
-                    return Err(LlmError::config(
-                        "DEEPSEEK_API_KEY is required because model route includes DeepSeek",
-                    ));
+
+            for provider_kind in required_providers {
+                match provider_kind {
+                    ModelProvider::OpenAi => providers.push((
+                        ModelProvider::OpenAi,
+                        Arc::new(openai::OpenAiRigProvider::new(config)?),
+                    )),
+                    ModelProvider::DeepSeek => providers.push((
+                        ModelProvider::DeepSeek,
+                        Arc::new(deepseek::DeepSeekRigProvider::new(config)?),
+                    )),
                 }
-                providers.push((
-                    ModelProvider::DeepSeek,
-                    Arc::new(deepseek::DeepSeekRigProvider::new(config)?),
-                ));
             }
 
             Ok(Arc::new(ModelRouteProvider::new(
@@ -288,6 +284,62 @@ fn auto_default_route(config: &AppConfig) -> Result<ModelRoute, LlmError> {
     ModelRoute::from_candidates(candidates)
 }
 
+fn auto_provider_routes(
+    config: &AppConfig,
+    default_route: &ModelRoute,
+) -> Result<Vec<(&'static str, ModelRoute)>, LlmError> {
+    let mut routes = config.configured_model_routes()?;
+    if let Some((_, route)) = routes.iter_mut().find(|(name, _)| *name == "LLM_MODEL") {
+        // provider 初始化必须使用 auto 模式的实际默认链，才能保留单 OpenAI
+        // 主模型自动追加 DeepSeek fallback 的兼容行为。
+        *route = default_route.clone();
+    }
+    Ok(routes)
+}
+
+fn provider_kinds_for_routes(
+    routes: &[(&'static str, ModelRoute)],
+    default_provider: ModelProvider,
+) -> Vec<ModelProvider> {
+    [ModelProvider::OpenAi, ModelProvider::DeepSeek]
+        .into_iter()
+        .filter(|provider| {
+            routes
+                .iter()
+                .any(|(_, route)| route_uses_provider(route, *provider, default_provider))
+        })
+        .collect()
+}
+
+fn ensure_deepseek_api_key_for_routes(
+    config: &AppConfig,
+    routes: &[(&'static str, ModelRoute)],
+) -> Result<(), LlmError> {
+    let uses_deepseek = routes
+        .iter()
+        .filter_map(|(name, route)| {
+            route_uses_provider(route, ModelProvider::DeepSeek, ModelProvider::OpenAi)
+                .then_some(*name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if uses_deepseek.is_empty() {
+        return Ok(());
+    }
+
+    let api_key = config.deepseek_api_key.as_ref().ok_or_else(|| {
+        LlmError::config(format!(
+            "DEEPSEEK_API_KEY is required because configured model routes include DeepSeek: {uses_deepseek}"
+        ))
+    })?;
+    if api_key.trim().is_empty() {
+        return Err(LlmError::config(format!(
+            "DEEPSEEK_API_KEY is required because configured model routes include DeepSeek: {uses_deepseek}"
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_route_supported(
     route: &ModelRoute,
     supported: ModelProvider,
@@ -378,6 +430,15 @@ fn aggregate_route_error(task: &str, failures: Vec<ModelAttemptFailure>) -> LlmE
 mod tests {
     use super::*;
     use crate::{
+        config::{
+            DEFAULT_APP_DB_FILE, DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_MAX_OUTPUT_TOKENS,
+            DEFAULT_MEMBER_ID_MAPPING_FILE, DEFAULT_PROMPT_DIR, DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            DEFAULT_RSS_HTTP_TIMEOUT_SECONDS, DEFAULT_RSS_MAX_BODY_BYTES,
+            DEFAULT_RSS_MAX_PUSH_PER_FEED, DEFAULT_RSS_POLL_INTERVAL_SECONDS,
+            DEFAULT_RSS_PUSH_MAX_FAILURES, DEFAULT_RSS_PUSH_MESSAGE_TYPE, DEFAULT_RSS_PUSH_URL,
+            DEFAULT_RSS_SEEN_RETENTION, DEFAULT_RSS_SUMMARY_MAX_CHARS, DEFAULT_SERVER_HOST,
+            DEFAULT_SERVER_PORT, DEFAULT_TTFT_WARN_SECONDS, ProviderMode,
+        },
         provider::types::{ChatMessage, ChatRequest},
         util::metrics::LlmMetrics,
     };
@@ -462,6 +523,66 @@ mod tests {
         }
     }
 
+    fn app_config(provider: ProviderMode, model: &str) -> AppConfig {
+        AppConfig {
+            provider,
+            model: model.to_owned(),
+            model_route: ModelRoute::parse_config(model, "LLM_MODEL").unwrap(),
+            title_model: None,
+            todo_model: None,
+            memory_model: None,
+            compact_model: None,
+            translation_model: None,
+            openai_search_model: "gpt-5.5".to_owned(),
+            openai_api_key: Some("test-openai-key".to_owned()),
+            openai_base_url: None,
+            deepseek_api_key: None,
+            deepseek_base_url: DEFAULT_DEEPSEEK_BASE_URL.to_owned(),
+            deepseek_model: "deepseek:deepseek-chat".to_owned(),
+            stream: true,
+            send_mode: "final".to_owned(),
+            request_timeout_seconds: DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            ttft_warn_seconds: DEFAULT_TTFT_WARN_SECONDS,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            server_host: DEFAULT_SERVER_HOST.to_owned(),
+            server_port: DEFAULT_SERVER_PORT,
+            app_db_file: DEFAULT_APP_DB_FILE.to_owned(),
+            rss_enabled: true,
+            rss_poll_interval_seconds: DEFAULT_RSS_POLL_INTERVAL_SECONDS,
+            rss_http_timeout_seconds: DEFAULT_RSS_HTTP_TIMEOUT_SECONDS,
+            rss_max_body_bytes: DEFAULT_RSS_MAX_BODY_BYTES,
+            rss_max_push_per_feed: DEFAULT_RSS_MAX_PUSH_PER_FEED,
+            rss_summary_max_chars: DEFAULT_RSS_SUMMARY_MAX_CHARS,
+            rss_seen_retention: DEFAULT_RSS_SEEN_RETENTION,
+            rss_push_max_failures: DEFAULT_RSS_PUSH_MAX_FAILURES,
+            rss_push_url: DEFAULT_RSS_PUSH_URL.to_owned(),
+            rss_push_token: None,
+            rss_push_message_type: DEFAULT_RSS_PUSH_MESSAGE_TYPE.to_owned(),
+            rss_allow_private_urls: false,
+            prompt_dir: DEFAULT_PROMPT_DIR.to_owned(),
+            prompt_dir_uses_builtin_defaults: true,
+            world_file: None,
+            member_id_mapping_file: DEFAULT_MEMBER_ID_MAPPING_FILE.to_owned(),
+            qweather_api_key: "test-qweather-key".to_owned(),
+            qweather_api_host: "https://api.qweather.com".to_owned(),
+            qweather_geo_host: "https://geoapi.qweather.com".to_owned(),
+        }
+    }
+
+    fn auto_required_provider_kinds(config: &AppConfig) -> Result<Vec<ModelProvider>, LlmError> {
+        let route = auto_default_route(config)?;
+        let provider_routes = auto_provider_routes(config, &route)?;
+        if provider_kinds_for_routes(&provider_routes, ModelProvider::OpenAi)
+            .contains(&ModelProvider::DeepSeek)
+        {
+            ensure_deepseek_api_key_for_routes(config, &provider_routes)?;
+        }
+        Ok(provider_kinds_for_routes(
+            &provider_routes,
+            ModelProvider::OpenAi,
+        ))
+    }
+
     fn route_provider(
         route: &str,
         openai_results: Vec<Result<ChatOutcome, LlmError>>,
@@ -480,6 +601,161 @@ mod tests {
         )
         .unwrap();
         (provider, openai, deepseek)
+    }
+
+    #[test]
+    fn auto_default_route_appends_deepseek_fallback_for_single_openai_model() {
+        let mut config = app_config(ProviderMode::Auto, "openai:gpt-5.4-mini");
+        config.deepseek_api_key = Some("test-deepseek-key".to_owned());
+
+        let route = auto_default_route(&config).unwrap();
+        let provider = build_provider(&config).unwrap();
+
+        assert_eq!(
+            route.display(),
+            "openai:gpt-5.4-mini,deepseek:deepseek-chat"
+        );
+        assert_eq!(
+            provider.model(),
+            "openai:gpt-5.4-mini,deepseek:deepseek-chat"
+        );
+    }
+
+    #[test]
+    fn auto_default_route_keeps_explicit_candidate_order() {
+        let mut config = app_config(ProviderMode::Auto, "openai:gpt-5.4-mini,openai:gpt-5.4");
+        config.deepseek_api_key = Some("test-deepseek-key".to_owned());
+
+        let route = auto_default_route(&config).unwrap();
+
+        assert_eq!(route.display(), "openai:gpt-5.4-mini,openai:gpt-5.4");
+    }
+
+    #[test]
+    fn auto_provider_set_includes_deepseek_from_translation_model() {
+        let mut config = app_config(ProviderMode::Auto, "openai:gpt-5.4-mini,openai:gpt-5.4");
+        config.deepseek_api_key = Some("test-deepseek-key".to_owned());
+        config.translation_model = Some("deepseek:deepseek-chat".to_owned());
+
+        let providers = auto_required_provider_kinds(&config).unwrap();
+        let provider = build_provider(&config).unwrap();
+
+        assert_eq!(
+            providers,
+            vec![ModelProvider::OpenAi, ModelProvider::DeepSeek]
+        );
+        assert_eq!(provider.model(), "openai:gpt-5.4-mini,openai:gpt-5.4");
+    }
+
+    #[test]
+    fn auto_provider_set_includes_specialty_deepseek_with_explicit_openai_main_chain() {
+        let mut config = app_config(ProviderMode::Auto, "openai:gpt-5.4-mini,openai:gpt-5.4");
+        config.deepseek_api_key = Some("test-deepseek-key".to_owned());
+        config.translation_model = Some("deepseek:deepseek-chat,openai:gpt-5.4-mini".to_owned());
+
+        let default_route = auto_default_route(&config).unwrap();
+        let providers = auto_required_provider_kinds(&config).unwrap();
+        let provider = build_provider(&config).unwrap();
+
+        assert_eq!(
+            default_route.display(),
+            "openai:gpt-5.4-mini,openai:gpt-5.4"
+        );
+        assert_eq!(
+            providers,
+            vec![ModelProvider::OpenAi, ModelProvider::DeepSeek]
+        );
+        assert_eq!(provider.model(), "openai:gpt-5.4-mini,openai:gpt-5.4");
+    }
+
+    #[test]
+    fn auto_provider_set_rejects_specialty_deepseek_without_api_key() {
+        let mut config = app_config(ProviderMode::Auto, "openai:gpt-5.4-mini,openai:gpt-5.4");
+        config.translation_model = Some("deepseek:deepseek-chat".to_owned());
+
+        let err = match build_provider(&config) {
+            Ok(_) => panic!("build_provider should reject missing DeepSeek API key"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, "config");
+        assert!(err.message.contains("DEEPSEEK_API_KEY"));
+        assert!(err.message.contains("TRANSLATION_MODEL"));
+    }
+
+    #[test]
+    fn auto_provider_set_keeps_openai_only_without_deepseek_key() {
+        let mut config = app_config(ProviderMode::Auto, "openai:gpt-5.4-mini");
+        config.title_model = Some("openai:gpt-5.4-mini".to_owned());
+        config.translation_model = Some("openai:gpt-5.4-mini".to_owned());
+
+        let providers = auto_required_provider_kinds(&config).unwrap();
+        let provider = build_provider(&config).unwrap();
+
+        assert_eq!(providers, vec![ModelProvider::OpenAi]);
+        assert_eq!(provider.name(), "auto");
+        assert_eq!(provider.model(), "openai:gpt-5.4-mini");
+    }
+
+    #[test]
+    fn auto_provider_set_deduplicates_repeated_specialty_providers() {
+        let mut config = app_config(ProviderMode::Auto, "openai:gpt-5.4-mini");
+        config.deepseek_api_key = Some("test-deepseek-key".to_owned());
+        config.title_model = Some("deepseek:deepseek-chat".to_owned());
+        config.todo_model = Some("deepseek:deepseek-chat,openai:gpt-5.4-mini".to_owned());
+        config.memory_model = Some("deepseek:deepseek-chat".to_owned());
+        config.translation_model = Some("deepseek:deepseek-chat".to_owned());
+
+        let providers = auto_required_provider_kinds(&config).unwrap();
+
+        assert_eq!(
+            providers,
+            vec![ModelProvider::OpenAi, ModelProvider::DeepSeek]
+        );
+    }
+
+    #[test]
+    fn auto_deepseek_only_does_not_require_openai_provider() {
+        let mut config = app_config(ProviderMode::Auto, "deepseek:deepseek-chat");
+        config.openai_api_key = None;
+        config.deepseek_api_key = Some("test-deepseek-key".to_owned());
+
+        let providers = auto_required_provider_kinds(&config).unwrap();
+        let provider = build_provider(&config).unwrap();
+
+        assert_eq!(providers, vec![ModelProvider::DeepSeek]);
+        assert_eq!(provider.name(), "auto");
+        assert_eq!(provider.model(), "deepseek:deepseek-chat");
+    }
+
+    #[test]
+    fn fixed_provider_modes_validate_specialty_routes_at_startup() {
+        let mut config = app_config(ProviderMode::OpenAi, "openai:gpt-5.4-mini");
+        config.translation_model = Some("deepseek:deepseek-chat".to_owned());
+
+        let err = match build_provider(&config) {
+            Ok(_) => panic!("build_provider should reject cross-provider specialty route"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, "config");
+        assert!(err.message.contains("TRANSLATION_MODEL"));
+        assert!(err.message.contains("requires provider `deepseek`"));
+    }
+
+    #[test]
+    fn configured_specialty_route_rejects_unsupported_provider_at_startup() {
+        let mut config = app_config(ProviderMode::Auto, "openai:gpt-5.4-mini");
+        config.translation_model = Some("anthropic:claude".to_owned());
+
+        let err = match build_provider(&config) {
+            Ok(_) => panic!("build_provider should reject unsupported provider prefix"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, "config");
+        assert!(err.message.contains("TRANSLATION_MODEL"));
+        assert!(err.message.contains("unsupported model provider prefix"));
     }
 
     #[test]

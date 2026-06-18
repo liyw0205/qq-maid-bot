@@ -233,6 +233,26 @@ impl AppConfig {
             qweather_geo_host,
         })
     }
+
+    /// 返回所有可能作为 `ChatRequest.model` 传入 provider 层的模型候选链。
+    ///
+    /// 这个列表用于启动阶段校验和 provider 初始化；新增内部专项模型配置时，
+    /// 需要同步加入这里，避免首次执行业务任务时才发现 provider 不可用。
+    pub fn configured_model_routes(&self) -> Result<Vec<(&'static str, ModelRoute)>, LlmError> {
+        let mut routes = vec![("LLM_MODEL", self.model_route.clone())];
+        for (name, value) in [
+            ("TITLE_MODEL", self.title_model.as_deref()),
+            ("TODO_MODEL", self.todo_model.as_deref()),
+            ("MEMORY_MODEL", self.memory_model.as_deref()),
+            ("COMPACT_MODEL", self.compact_model.as_deref()),
+            ("TRANSLATION_MODEL", self.translation_model.as_deref()),
+        ] {
+            if let Some(value) = value {
+                routes.push((name, ModelRoute::parse_config(value, name)?));
+            }
+        }
+        Ok(routes)
+    }
 }
 
 /// 默认项目通用 SQLite 文件路径。
