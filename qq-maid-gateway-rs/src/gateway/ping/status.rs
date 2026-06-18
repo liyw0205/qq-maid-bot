@@ -1,0 +1,166 @@
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use qq_maid_common::time_context::{format_duration_for_display, now_unix_seconds_marker};
+
+use crate::gateway::{event::C2cMessage, logging::mask_identifier};
+
+#[derive(Debug, Clone)]
+pub struct GatewayRuntimeStatus {
+    pub pid: u32,
+    pub instance_id: String,
+    pub started_at: String,
+    started_instant: Instant,
+    state: Arc<Mutex<GatewayRuntimeSnapshot>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayRuntimeSnapshot {
+    pub state_error: Option<String>,
+    pub last_gateway_connected_at: Option<String>,
+    pub last_ready_at: Option<String>,
+    pub last_resumed_at: Option<String>,
+    pub last_heartbeat_ack_at: Option<String>,
+    pub last_reconnect_at: Option<String>,
+    pub last_invalid_session: Option<InvalidSessionSnapshot>,
+    pub last_c2c_received_at: Option<String>,
+    pub last_c2c_message_id: Option<String>,
+    pub last_qq_send_success_at: Option<String>,
+    pub last_qq_send_failure_at: Option<String>,
+    pub last_qq_send_failure_summary: Option<String>,
+    pub last_respond_success_at: Option<String>,
+    pub last_respond_failure_at: Option<String>,
+    pub last_respond_failure_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSessionSnapshot {
+    pub at: String,
+    pub can_resume: bool,
+}
+
+impl GatewayRuntimeStatus {
+    pub fn new() -> Self {
+        let started_at = now_unix_seconds_marker();
+        Self {
+            pid: std::process::id(),
+            instance_id: format!("gateway-{}-{started_at}", std::process::id()),
+            started_at,
+            started_instant: Instant::now(),
+            state: Arc::new(Mutex::new(GatewayRuntimeSnapshot::default())),
+        }
+    }
+
+    pub fn uptime_text(&self) -> String {
+        format_duration_for_display(self.started_instant.elapsed())
+    }
+
+    pub fn snapshot(&self) -> GatewayRuntimeSnapshot {
+        match self.state.lock() {
+            Ok(state) => state.clone(),
+            Err(_) => GatewayRuntimeSnapshot {
+                state_error: Some("runtime state lock poisoned".to_owned()),
+                ..GatewayRuntimeSnapshot::default()
+            },
+        }
+    }
+
+    pub fn record_gateway_connected(&self) {
+        self.update_state(|state| {
+            state.last_gateway_connected_at = Some(now_unix_seconds_marker())
+        });
+    }
+
+    pub fn record_ready(&self) {
+        self.update_state(|state| state.last_ready_at = Some(now_unix_seconds_marker()));
+    }
+
+    pub fn record_resumed(&self) {
+        self.update_state(|state| state.last_resumed_at = Some(now_unix_seconds_marker()));
+    }
+
+    pub fn record_heartbeat_ack(&self) {
+        self.update_state(|state| state.last_heartbeat_ack_at = Some(now_unix_seconds_marker()));
+    }
+
+    pub fn record_reconnect(&self) {
+        self.update_state(|state| state.last_reconnect_at = Some(now_unix_seconds_marker()));
+    }
+
+    pub fn record_invalid_session(&self, can_resume: bool) {
+        self.update_state(|state| {
+            state.last_invalid_session = Some(InvalidSessionSnapshot {
+                at: now_unix_seconds_marker(),
+                can_resume,
+            });
+        });
+    }
+
+    pub fn record_c2c_message_received(&self, message: &C2cMessage) {
+        self.update_state(|state| {
+            state.last_c2c_received_at = Some(now_unix_seconds_marker());
+            // runtime 快照只保留脱敏后的消息 ID，避免 `/ping all` 暴露原始 openid/message_id。
+            state.last_c2c_message_id = Some(mask_identifier(&message.message_id));
+        });
+    }
+
+    pub fn record_qq_send_success(&self) {
+        self.update_state(|state| state.last_qq_send_success_at = Some(now_unix_seconds_marker()));
+    }
+
+    pub fn record_qq_send_failure(&self, summary: impl Into<String>) {
+        self.update_state(|state| {
+            state.last_qq_send_failure_at = Some(now_unix_seconds_marker());
+            state.last_qq_send_failure_summary = Some(compact_summary(summary.into()));
+        });
+    }
+
+    pub fn record_respond_success(&self) {
+        self.update_state(|state| state.last_respond_success_at = Some(now_unix_seconds_marker()));
+    }
+
+    pub fn record_respond_failure(&self, summary: impl Into<String>) {
+        self.update_state(|state| {
+            state.last_respond_failure_at = Some(now_unix_seconds_marker());
+            state.last_respond_failure_summary = Some(compact_summary(summary.into()));
+        });
+    }
+
+    pub(super) fn started_elapsed(&self) -> Duration {
+        self.started_instant.elapsed()
+    }
+
+    pub(super) fn update_state(&self, update: impl FnOnce(&mut GatewayRuntimeSnapshot)) {
+        if let Ok(mut state) = self.state.lock() {
+            update(&mut state);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test() -> Self {
+        Self {
+            pid: 42,
+            instance_id: "gateway-test".to_owned(),
+            started_at: "unix:1".to_owned(),
+            started_instant: Instant::now() - Duration::from_secs(5),
+            state: Arc::new(Mutex::new(GatewayRuntimeSnapshot::default())),
+        }
+    }
+}
+
+impl Default for GatewayRuntimeStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn compact_summary(summary: String) -> String {
+    let text = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut compact = text.chars().take(120).collect::<String>();
+    if text.chars().count() > 120 {
+        compact.push_str("...");
+    }
+    compact
+}
