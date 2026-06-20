@@ -128,8 +128,10 @@ async fn help_todo_returns_module_details() {
     assert!(text.starts_with("✅ 待办帮助"));
     assert!(text.contains("/todo done [编号...]"));
     assert!(text.contains("确认后再写入"));
+    assert!(text.contains("列表编号或关键词匹配"));
     assert!(markdown.starts_with("# ✅ 待办帮助"));
     assert!(markdown.contains("`/todo done [编号...]`"));
+    assert!(markdown.contains("列表编号或关键词匹配"));
 }
 
 #[tokio::test]

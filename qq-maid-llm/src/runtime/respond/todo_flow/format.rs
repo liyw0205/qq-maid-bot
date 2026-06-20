@@ -28,9 +28,9 @@ pub(super) fn format_todo_numbered_item_operation_result(
         rows.push(format!("{success_label}："));
         markdown_rows.push(format!("# {}", escape_markdown_inline(success_label)));
         rows.extend(
-            success_items
-                .iter()
-                .map(|(number, item)| format!("[{number}] {}", truncate_chars(&item.title, 80))),
+            success_items.iter().map(|(number, item)| {
+                format!("第 {number} 条：{}", truncate_chars(&item.title, 80))
+            }),
         );
         markdown_rows.extend(success_items.iter().map(|(number, item)| {
             format!("- {}", format_todo_numbered_item_markdown(*number, item))
@@ -120,22 +120,6 @@ pub(super) fn format_todo_search_reply(items: &[TodoItem], query: &str) -> Comma
     CommandBody::dual(rows.join("\n"), markdown_rows.join("\n"))
 }
 
-pub(super) fn format_todo_index_edit_hint(todo_id: &str, body: &str) -> CommandBody {
-    let text = format!(
-        "看起来你想修改待办 [{}]，请使用：\n/todo edit {} 标题：{}；内容：...",
-        todo_id.trim(),
-        todo_id.trim(),
-        body.trim()
-    );
-    let markdown = format!(
-        "# 修改待办提示\n\n看起来你想修改待办 `{}`，请使用：\n\n`/todo edit {} 标题：{}；内容：...`",
-        escape_markdown_inline(todo_id.trim()),
-        escape_markdown_inline(todo_id.trim()),
-        escape_markdown_inline(body.trim())
-    );
-    CommandBody::dual(text, markdown)
-}
-
 pub(super) fn format_completed_todo_time_query_reply(
     items: &[TodoItem],
     source_condition: &str,
@@ -153,8 +137,9 @@ pub(super) fn format_completed_todo_time_query_reply(
     CommandBody::dual(rows.join("\n"), markdown_rows.join("\n"))
 }
 
-/// 通用待办行格式化：`序号. [id] 标题`，换行后跟一行时间（标签由 `time_label` 指定，
+/// 通用待办行格式化：`序号. 标题`，换行后跟一行时间（标签由 `time_label` 指定，
 /// 时间值由 `time_value` 计算），若有详情再追加一行。
+/// 内部 ID 只能留在快照映射和存储层，这里只渲染用户可读字段。
 fn format_todo_rows_with_time(
     items: &[TodoItem],
     time_label: &str,
@@ -231,7 +216,7 @@ fn display_todo_status(item: &TodoItem) -> &'static str {
 }
 
 pub(super) fn format_todo_inline(item: &TodoItem) -> String {
-    format!("[{}] {}", item.id, truncate_chars(&item.title, 80))
+    truncate_chars(&item.title, 80)
 }
 
 pub(super) fn format_todo_edit_result(item: &TodoItem) -> String {
@@ -540,16 +525,42 @@ fn format_todo_candidate_rows(items: &[TodoItem]) -> Vec<String> {
 }
 
 pub(super) fn format_todo_no_match_reply(target: &str) -> CommandBody {
+    simple_todo_notice(&format!("没有找到匹配的未完成待办：{}", target.trim()))
+}
+
+pub(super) fn format_todo_missing_pending_index_reply(index: usize) -> CommandBody {
     simple_todo_notice(&format!(
-        "没有找到匹配的未完成待办：{}",
-        target.trim().trim_matches(&['[', ']'][..])
+        "当前待办序号已失效或不存在第 {index} 条，请重新执行 /todo 获取最新列表。"
     ))
 }
 
-pub(super) fn format_todo_no_list_index_reply(index: usize) -> CommandBody {
+pub(super) fn format_todo_missing_completed_index_reply(index: usize) -> CommandBody {
     simple_todo_notice(&format!(
-        "最近的待办列表里没有第 {index} 条。请先发送 /todo 查看列表，或使用 [真实ID]。"
+        "当前已完成待办序号已失效或不存在第 {index} 条，请重新执行 /todo done 获取最新列表。"
     ))
+}
+
+pub(super) fn format_todo_pending_snapshot_unavailable_reply() -> CommandBody {
+    simple_todo_notice("当前待办序号已失效，请重新执行 /todo 获取最新列表。")
+}
+
+pub(super) fn format_todo_completed_snapshot_unavailable_reply() -> CommandBody {
+    simple_todo_notice("当前已完成待办序号已失效，请重新执行 /todo done 获取最新列表。")
+}
+
+pub(super) fn format_todo_edit_usage_reply() -> CommandBody {
+    CommandBody::plain("用法：/todo edit 列表序号或关键词 新内容")
+}
+
+pub(super) fn format_todo_delete_usage_reply() -> CommandBody {
+    CommandBody::plain("用法：/todo delete 列表序号或关键词；清理已完成任务用 /todo delete done")
+}
+
+pub(super) fn format_todo_inline_markdown(item: &TodoItem) -> String {
+    format!(
+        "**{}**",
+        escape_markdown_text(&truncate_chars(&item.title, 80))
+    )
 }
 
 pub(super) fn build_todo_confirm_hint() -> String {
@@ -564,16 +575,8 @@ pub(super) fn simple_todo_notice(text: &str) -> CommandBody {
     CommandBody::dual(text.to_owned(), escape_markdown_text(text))
 }
 
-pub(super) fn format_todo_inline_markdown(item: &TodoItem) -> String {
-    format!(
-        "**[{}] {}**",
-        escape_markdown_inline(&item.id),
-        escape_markdown_text(&truncate_chars(&item.title, 80))
-    )
-}
-
 pub(super) fn format_todo_numbered_item_markdown(number: usize, item: &TodoItem) -> String {
-    format!("`[{number}]` {}", format_todo_inline_markdown(item))
+    format!("第 {number} 条：{}", format_todo_inline_markdown(item))
 }
 
 fn format_todo_rows_markdown(items: &[TodoItem], with_status: bool) -> Vec<String> {
