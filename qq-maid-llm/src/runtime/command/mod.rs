@@ -53,6 +53,7 @@ fn normalize_command(command: &str) -> Option<String> {
         "todo" | "待办" | "任务" => "todo",
         "rss" | "订阅" => "rss",
         "查" | "查询" | "search" => "web_search",
+        "train" | "火车" => "train",
         "weather" | "天气" => "weather",
         _ => return None,
     };

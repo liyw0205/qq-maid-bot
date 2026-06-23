@@ -30,6 +30,7 @@ use crate::{
         rss::{RssFetchConfig, RssFetcher, RssStore},
         session::{SessionMeta, SessionStore},
         todo::{TodoItem, TodoStatus, TodoStore, TodoTimePrecision},
+        train::{TrainExecutor, TrainSchedule, TrainScheduleRequest, TrainStop},
         weather::{
             AirQualitySummary, CurrentWeather, DailyWeather, WeatherAlert, WeatherExecutor,
             WeatherLifeIndex, WeatherLocation, WeatherOutcome, WeatherRequest, WeatherSupplement,
@@ -65,6 +66,15 @@ pub(super) struct SupplementWeatherExecutor {
 }
 
 pub(super) struct FailingQueryExecutor {
+    pub(super) err: LlmError,
+}
+
+#[derive(Clone)]
+pub(super) struct MockTrainExecutor {
+    requests: Arc<Mutex<Vec<TrainScheduleRequest>>>,
+}
+
+pub(super) struct FailingTrainExecutor {
     pub(super) err: LlmError,
 }
 
@@ -125,6 +135,18 @@ impl MockWeatherExecutor {
     }
 
     pub(super) fn requests(&self) -> Vec<WeatherRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl MockTrainExecutor {
+    pub(super) fn new() -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub(super) fn requests(&self) -> Vec<TrainScheduleRequest> {
         self.requests.lock().unwrap().clone()
     }
 }
@@ -461,6 +483,69 @@ impl QueryExecutor for FailingQueryExecutor {
 
     fn provider_name(&self) -> &'static str {
         "mock-query"
+    }
+}
+
+#[async_trait]
+impl TrainExecutor for MockTrainExecutor {
+    async fn query_train_schedule(
+        &self,
+        req: TrainScheduleRequest,
+    ) -> Result<TrainSchedule, LlmError> {
+        self.requests.lock().unwrap().push(req.clone());
+        Ok(TrainSchedule {
+            train_code: req.train_code.clone(),
+            travel_date: req.travel_date,
+            start_station: "北京南".to_owned(),
+            end_station: "上海虹桥".to_owned(),
+            stops: vec![
+                TrainStop {
+                    station_no: 1,
+                    station_name: "北京南".to_owned(),
+                    arrive_time: None,
+                    departure_time: Some("06:30".to_owned()),
+                    stopover_minutes: None,
+                    day_difference: 0,
+                    station_train_code: req.train_code.clone(),
+                },
+                TrainStop {
+                    station_no: 2,
+                    station_name: "南京南".to_owned(),
+                    arrive_time: Some("10:13".to_owned()),
+                    departure_time: Some("10:15".to_owned()),
+                    stopover_minutes: Some(2),
+                    day_difference: 0,
+                    station_train_code: req.train_code.clone(),
+                },
+                TrainStop {
+                    station_no: 3,
+                    station_name: "上海虹桥".to_owned(),
+                    arrive_time: Some("11:24".to_owned()),
+                    departure_time: None,
+                    stopover_minutes: None,
+                    day_difference: 0,
+                    station_train_code: req.train_code.clone(),
+                },
+            ],
+        })
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "mock-train"
+    }
+}
+
+#[async_trait]
+impl TrainExecutor for FailingTrainExecutor {
+    async fn query_train_schedule(
+        &self,
+        _req: TrainScheduleRequest,
+    ) -> Result<TrainSchedule, LlmError> {
+        Err(self.err.clone())
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "mock-train"
     }
 }
 
@@ -855,11 +940,34 @@ pub(super) fn test_service_with_provider_base_title_query_and_models(
     memory_model: Option<String>,
     compact_model: Option<String>,
 ) -> (RustRespondService, PathBuf) {
+    test_service_with_provider_base_title_query_weather_train_and_models(
+        provider,
+        title_model,
+        query_executor,
+        weather_executor,
+        Arc::new(MockTrainExecutor::new()),
+        todo_model,
+        memory_model,
+        compact_model,
+    )
+}
+
+pub(super) fn test_service_with_provider_base_title_query_weather_train_and_models(
+    provider: MockProvider,
+    title_model: Option<String>,
+    query_executor: Arc<dyn QueryExecutor>,
+    weather_executor: Arc<dyn WeatherExecutor>,
+    train_executor: Arc<dyn TrainExecutor>,
+    todo_model: Option<String>,
+    memory_model: Option<String>,
+    compact_model: Option<String>,
+) -> (RustRespondService, PathBuf) {
     test_service_with_provider_base_title_query_weather_and_models(
         provider,
         title_model,
         query_executor,
         weather_executor,
+        train_executor,
         TestModelOptions {
             todo_model,
             memory_model,
@@ -878,6 +986,7 @@ pub(super) fn test_service_with_translation_model(
         None,
         Arc::new(MockQueryExecutor),
         Arc::new(MockWeatherExecutor::new()),
+        Arc::new(MockTrainExecutor::new()),
         TestModelOptions {
             todo_model: None,
             memory_model: None,
@@ -893,6 +1002,7 @@ fn test_service_with_provider_base_title_query_weather_and_models(
     title_model: Option<String>,
     query_executor: Arc<dyn QueryExecutor>,
     weather_executor: Arc<dyn WeatherExecutor>,
+    train_executor: Arc<dyn TrainExecutor>,
     models: TestModelOptions,
 ) -> (RustRespondService, PathBuf) {
     let base = std::env::temp_dir().join(format!("qq-maid-respond-{}", Uuid::new_v4()));
@@ -909,6 +1019,7 @@ fn test_service_with_provider_base_title_query_weather_and_models(
         Arc::new(provider),
         query_executor,
         weather_executor,
+        train_executor,
         RespondStores {
             memory_store: MemoryStore::new(database.clone()),
             session_store: SessionStore::new(database.clone()),

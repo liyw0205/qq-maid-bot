@@ -77,11 +77,17 @@ const HELP_MODULES: &[HelpModule] = &[
     },
     HelpModule {
         key: "search",
-        aliases: &["查询", "搜索"],
+        aliases: &["查询", "搜索", "火车"],
         title: "🔎 联网查询",
-        summary: "通过项目配置的查询流程检索并整理信息。",
-        commands: &["- `/查 问题`：联网查询；别名 `/查询`、`/search`"],
-        notes: &["- 中文命令也支持紧凑写法，例如 `/查今天的 Rust 新闻`。"],
+        summary: "提供联网搜索和列车时刻查询两类查询命令。",
+        commands: &[
+            "- `/查 问题`：联网查询；别名 `/查询`、`/search`",
+            "- `/火车 G1 [日期]`：查询指定车次的经停时刻；日期默认今天",
+        ],
+        notes: &[
+            "- 中文联网查询支持紧凑写法，例如 `/查今天的 Rust 新闻`。",
+            "- `/火车` 当前只查询时刻表，支持 今天、明天、后天、YYYY-MM-DD、YYYY年M月D日 或 M月D日。",
+        ],
     },
     HelpModule {
         key: "translation",
@@ -168,7 +174,7 @@ fn format_help_home() -> CommandBody {
     render.bullet("✅ 待办：`/todo`");
     render.bullet("📰 RSS / Atom：`/rss`");
     render.bullet("🌤 天气：`/天气 杭州`");
-    render.bullet("🔎 查询：`/查 问题`");
+    render.bullet("🔎 查询：`/查 问题`、`/火车 G1`");
     render.bullet("🧠 记忆：`/memory`");
     render.bullet("🗂 会话：`/state`");
     render.bullet("🩺 状态：私聊发送 `/ping`");

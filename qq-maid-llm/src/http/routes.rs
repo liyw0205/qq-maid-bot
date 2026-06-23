@@ -39,6 +39,7 @@ use crate::{
         rss::{RssFetcher, RssStore},
         session::SessionStore,
         todo::TodoStore,
+        train::DynTrainExecutor,
         weather::DynWeatherExecutor,
     },
     util::metrics::MetricsRecorder,
@@ -57,6 +58,8 @@ pub struct AppState {
     pub query_executor: DynQueryExecutor,
     /// 天气查询执行器。
     pub weather_executor: DynWeatherExecutor,
+    /// 列车时刻查询执行器。
+    pub train_executor: DynTrainExecutor,
     /// 记忆存储。
     pub memory_store: MemoryStore,
     /// 会话存储。
@@ -345,6 +348,7 @@ async fn respond(
         state.provider.clone(),
         state.query_executor.clone(),
         state.weather_executor.clone(),
+        state.train_executor.clone(),
         RespondStores {
             memory_store: state.memory_store.clone(),
             session_store: state.session_store.clone(),
@@ -566,6 +570,7 @@ mod tests {
             query::{QueryExecutor, QueryOutcome, QueryRequest, QuerySource},
             rss::RssFetchConfig,
             session::{SessionMeta, SessionStore},
+            train::{TrainExecutor, TrainSchedule, TrainScheduleRequest, TrainStop},
             weather::{
                 CurrentWeather, DailyWeather, WeatherExecutor, WeatherLocation, WeatherOutcome,
                 WeatherRequest, WeatherSupplement,
@@ -598,6 +603,8 @@ mod tests {
     struct MockQueryExecutor;
 
     struct MockWeatherExecutor;
+
+    struct MockTrainExecutor;
 
     #[async_trait]
     impl LlmProvider for MockProvider {
@@ -727,6 +734,34 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl TrainExecutor for MockTrainExecutor {
+        async fn query_train_schedule(
+            &self,
+            req: TrainScheduleRequest,
+        ) -> Result<TrainSchedule, LlmError> {
+            Ok(TrainSchedule {
+                train_code: req.train_code,
+                travel_date: req.travel_date,
+                start_station: "北京南".to_owned(),
+                end_station: "上海虹桥".to_owned(),
+                stops: vec![TrainStop {
+                    station_no: 1,
+                    station_name: "北京南".to_owned(),
+                    arrive_time: None,
+                    departure_time: Some("06:30".to_owned()),
+                    stopover_minutes: None,
+                    day_difference: 0,
+                    station_train_code: "G1".to_owned(),
+                }],
+            })
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "mock-train"
+        }
+    }
+
     fn write_prompt_set(dir: &std::path::Path) {
         fs::create_dir_all(dir).unwrap();
         for file_name in crate::runtime::prompt::PROMPT_FILES {
@@ -808,6 +843,7 @@ mod tests {
             upstream_status,
             query_executor: Arc::new(MockQueryExecutor),
             weather_executor: Arc::new(MockWeatherExecutor),
+            train_executor: Arc::new(MockTrainExecutor),
             memory_store: MemoryStore::new(database.clone()),
             session_store: SessionStore::new(database.clone()),
             todo_store: TodoStore::new(database.clone()),

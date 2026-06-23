@@ -1,13 +1,13 @@
 # qq-maid-llm — Rust LLM 服务
 
-`qq-maid-llm/` 是 QQ Maid Bot 的业务服务，负责 `/v1/respond`、普通聊天、联网查询、天气、翻译、会话、长期记忆、Todo、RSS / Atom 订阅和模型 provider 调用。
+`qq-maid-llm/` 是 QQ Maid Bot 的业务服务，负责 `/v1/respond`、普通聊天、联网查询、列车时刻查询、天气、翻译、会话、长期记忆、Todo、RSS / Atom 订阅和模型 provider 调用。
 
 QQ 平台事件解析、白名单、`/ping` 本地诊断和消息回发不在本模块处理，相关实现见 [qq-maid-gateway-rs/README.md](../qq-maid-gateway-rs/README.md)。运行目录、私有配置、部署产物和数据文件说明见 [runtime/README.md](../runtime/README.md)。
 
 ## 当前范围
 
 - HTTP 层默认只公开 `GET /healthz` 和 `POST /v1/respond`；本地 Web 控制台默认关闭，启用后才注册 `/console/` 和 `/api/v1/markdown/render`。
-- 普通聊天、查询、天气、翻译、会话命令、长期记忆、Todo 和 RSS 指令都通过 `/v1/respond` 内部分发。
+- 普通聊天、查询、列车时刻、天气、翻译、会话命令、长期记忆、Todo 和 RSS 指令都通过 `/v1/respond` 内部分发。
 - Session、Todo、长期记忆、RSS / Atom 订阅和 RSS 去重状态统一写入 `APP_DB_FILE` 指向的 SQLite。
 - 长期记忆只能通过明确 `/memory`、`/记忆`、`/记` 指令生成草稿，用户确认后写入；普通聊天不会自动写长期记忆。
 - RSS 后台轮询由本服务调度，主动推送通过 gateway 的本机 `/internal/push` 出口发送。
@@ -32,6 +32,7 @@ qq-maid-llm/src/
 │   ├── session.rs       # 会话领域逻辑
 │   ├── memory.rs        # 长期记忆领域逻辑
 │   ├── todo.rs          # Todo 领域逻辑
+│   ├── train/           # 列车时刻查询执行器
 │   └── weather/         # 天气执行器
 ├── storage/             # SQLite、migration、session/memory/todo/rss 持久化
 └── util/                # SSE、指标，以及 time_context 兼容 re-export
@@ -81,6 +82,7 @@ Gateway 的 `/ping check` 会在该入口发送内部诊断动作，直接执行
 - 待办：`/todo`、`/todo add 内容`、`/todo done 1`、`/todo undo 1`、`/todo edit 1 新内容`、`/todo delete 1`；中文别名 `/待办`、`/任务`。
 - RSS：`/rss`、`/rss add RSS地址 [名称]`、`/rss delete 1`、`/rss test RSS地址`；中文别名 `/订阅`。
 - 查询：`/查 关键词`、`/查询 关键词`、`/search 关键词`。
+- 列车：`/火车 G1`、`/火车 G1 明天`、`/火车 G1 2026-06-28`；未提供日期时默认今天，当前只做时刻查询。
 - 天气：`/天气杭州`、`/天气 杭州`、`/杭州天气`、`/weather 杭州`。
 - 翻译：`/翻译 文本`、`/翻译日语 文本`、`/翻译成英语 文本`。
 

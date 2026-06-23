@@ -14,6 +14,7 @@ use crate::{
         rss::{RssFetcher, RssStore},
         session::{SessionMeta, SessionStore},
         todo::TodoStore,
+        train::DynTrainExecutor,
         translation::TranslationService,
         weather::DynWeatherExecutor,
     },
@@ -39,6 +40,7 @@ mod session_flow;
 mod tests;
 mod title;
 mod todo_flow;
+mod train_flow;
 mod translation_flow;
 mod weather_flow;
 
@@ -92,6 +94,8 @@ pub struct RustRespondService {
     query_executor: DynQueryExecutor,
     /// 天气查询执行器
     weather_executor: DynWeatherExecutor,
+    /// 列车时刻查询执行器
+    train_executor: DynTrainExecutor,
     /// 长期记忆存储
     memory_store: MemoryStore,
     /// 会话记录存储
@@ -130,6 +134,7 @@ impl RustRespondService {
         provider: DynLlmProvider,
         query_executor: DynQueryExecutor,
         weather_executor: DynWeatherExecutor,
+        train_executor: DynTrainExecutor,
         stores: RespondStores,
         rss_fetcher: RssFetcher,
         prompt_config: PromptConfig,
@@ -141,6 +146,7 @@ impl RustRespondService {
             provider,
             query_executor,
             weather_executor,
+            train_executor,
             memory_store: stores.memory_store,
             session_store: stores.session_store,
             todo_store: stores.todo_store,
@@ -242,6 +248,14 @@ impl RustRespondService {
         if let Some(command) = weather_flow::parse_weather_command(&user_text) {
             return Ok(json_transport(
                 self.handle_weather_command(command, &user_text, &mut session)
+                    .await?,
+            ));
+        }
+
+        // 检查是否为列车时刻查询指令（如 "/火车 G1 明天"）
+        if let Some(command) = train_flow::parse_train_command(&user_text) {
+            return Ok(json_transport(
+                self.handle_train_command(command, &user_text, &mut session)
                     .await?,
             ));
         }

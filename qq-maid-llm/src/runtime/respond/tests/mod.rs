@@ -6,6 +6,7 @@ mod search;
 mod session;
 mod support;
 mod todo;
+mod train;
 mod translation;
 mod weather;
 mod weather_format;
