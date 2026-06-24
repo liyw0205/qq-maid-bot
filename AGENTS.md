@@ -165,22 +165,26 @@ Rust HTTP 层只公开：
 
 ## 常用验证
 
-从仓库根目录执行：
+`.github/workflows/ci.yml` 在 PR / push 到 master 时会跑以下四步，提交前在本地直接复跑，避免 CI 失败往返：
 
 ```bash
-make test-core
-make test-gateway
-make test
-make build
-make diagnose
+# 1. 格式化检查（不写入，仅校验）
+cargo fmt --all -- --check
+
+# 2. Clippy，警告视为错误
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# 3. 全 workspace 测试
+cargo test --workspace --all-features
+
+# 4. release 构建
+cargo build --workspace --release --all-features
 ```
 
 最低要求：
 
-* 修改 Rust Core：至少执行 `make test-core`。
-* 修改 Rust gateway：至少执行 `make test-gateway`。
-* 修改 Rust common：至少执行 `make test-common`；若影响 Core 或 gateway 调用方，再执行对应模块测试。
-* 跨 Core / gateway 或提交前：执行 `make test`。
+* 提交前至少跑完 1–3 步。
+* 改动涉及启动、配置、依赖或发布时，再跑第 4 步。
 * 修改 `scripts/*.sh`：至少执行 `bash -n` 对应脚本。
 * 涉及诊断入口时执行 `make diagnose`。
 * 修改启动、配置、依赖、QQ 事件或 OpenAI / DeepSeek 调用：需要本地启动验证。
