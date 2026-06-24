@@ -8,9 +8,9 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use reqwest::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{config::AppConfig, error::LlmError};
 
@@ -42,6 +42,12 @@ pub struct TrainStop {
     pub stopover_minutes: Option<u32>,
     /// 相对发车日的跨日偏移。
     pub day_difference: i32,
+    /// `dayDifference` 是否由 12306 原值可靠解析得到。
+    ///
+    /// `/火车` 查询回复仍可沿用 `day_difference=0` 的宽松回退展示时刻表，
+    /// 但火车 Todo 校验层必须借助该标记拒绝“不可信但被兜底成 0”的情况，
+    /// 避免把跨日行程误写成当天提醒。
+    pub day_difference_reliable: bool,
     /// 该站对应的站内车次显示值；部分跨线车会与主车次不同。
     pub station_train_code: String,
 }
@@ -161,7 +167,11 @@ struct TrainApiDetail {
 
 #[derive(Debug, Deserialize)]
 struct TrainApiStop {
-    #[serde(rename = "stationNo", default)]
+    #[serde(
+        rename = "stationNo",
+        default,
+        deserialize_with = "deserialize_optional_stringish"
+    )]
     station_no: Option<String>,
     #[serde(rename = "stationName", default)]
     station_name: Option<String>,
@@ -171,10 +181,34 @@ struct TrainApiStop {
     start_time: Option<String>,
     #[serde(rename = "stopover_time", default)]
     stopover_time: Option<String>,
-    #[serde(rename = "dayDifference", default)]
+    #[serde(
+        rename = "dayDifference",
+        default,
+        deserialize_with = "deserialize_optional_stringish"
+    )]
     day_difference: Option<String>,
     #[serde(rename = "stationTrainCode", default)]
     station_train_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StringishValue {
+    String(String),
+    Signed(i64),
+    Unsigned(u64),
+}
+
+fn deserialize_optional_stringish<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<StringishValue>::deserialize(deserializer)?;
+    Ok(value.map(|value| match value {
+        StringishValue::String(text) => text,
+        StringishValue::Signed(number) => number.to_string(),
+        StringishValue::Unsigned(number) => number.to_string(),
+    }))
 }
 
 impl TrainApiResponse {
@@ -197,13 +231,19 @@ impl TrainApiResponse {
 
         let mut stops = Vec::with_capacity(detail.stop_time.len());
         for (index, stop) in detail.stop_time.into_iter().enumerate() {
+            let (day_difference, day_difference_reliable) =
+                parse_day_difference_field(stop.day_difference.as_deref());
             stops.push(TrainStop {
-                station_no: parse_u32_field(stop.station_no.as_deref()).unwrap_or(index as u32 + 1),
+                // `stationNo` 和 `dayDifference` 在 12306 返回里偶发缺失或格式漂移，
+                // `/火车` 旧能力应尽量保留时刻表，而不是让整趟车直接硬失败。
+                // 更严格的出发/到达时间约束继续留给下游火车 Todo 校验层处理。
+                station_no: parse_station_no_field(stop.station_no.as_deref(), index),
                 station_name: required_train_field(stop.station_name, "stationName")?,
                 arrive_time: normalize_train_time(stop.arrive_time.as_deref()),
                 departure_time: normalize_train_time(stop.start_time.as_deref()),
                 stopover_minutes: parse_u32_field(stop.stopover_time.as_deref()),
-                day_difference: parse_i32_field(stop.day_difference.as_deref()).unwrap_or(0),
+                day_difference,
+                day_difference_reliable,
                 station_train_code: stop
                     .station_train_code
                     .map(|value| value.trim().to_owned())
@@ -248,6 +288,17 @@ fn required_train_field(value: Option<String>, field_name: &str) -> Result<Strin
                 "train_json",
             )
         })
+}
+
+fn parse_station_no_field(value: Option<&str>, index: usize) -> u32 {
+    parse_u32_field(value).unwrap_or_else(|| (index + 1) as u32)
+}
+
+fn parse_day_difference_field(value: Option<&str>) -> (i32, bool) {
+    match parse_i32_field(value) {
+        Some(value) => (value, true),
+        None => (0, false),
+    }
 }
 
 fn normalize_train_time(value: Option<&str>) -> Option<String> {
@@ -295,4 +346,648 @@ fn no_schedule_error() -> LlmError {
         "no train schedule found for the requested date",
         "train",
     )
+}
+
+/// 站名归一化：去除首尾空白并去掉末尾的“站”字，用于把“杭州东站”与“杭州东”视作同一站。
+///
+/// 注意：只做最小归一化，不会把“杭州”替换成“杭州东”，避免静默改变用户语义。
+pub fn normalize_station_name(name: &str) -> String {
+    let trimmed = name.trim();
+    let without_suffix = trimmed.strip_suffix('站').unwrap_or(trimmed);
+    without_suffix.trim().to_owned()
+}
+
+/// 在时刻表中按站名查找经停站。
+///
+/// 匹配规则：用户输入与经停站名都经过 [`normalize_station_name`] 归一化后做精确比较。
+/// 找不到时返回 `None`，由调用方决定如何提示用户。
+pub fn find_stop_by_name<'a>(schedule: &'a TrainSchedule, station: &str) -> Option<&'a TrainStop> {
+    let target = normalize_station_name(station);
+    schedule
+        .stops
+        .iter()
+        .find(|stop| normalize_station_name(&stop.station_name) == target)
+}
+
+/// 火车行程草稿，承载 LLM 解析结果和 12306 校验后的时间。
+///
+/// `departure_at` / `arrive_at` 在校验成功后填充，用于 Todo 提醒；
+/// 未校验时（例如 LLM 解析阶段）可以为 `None`。
+///
+/// 该结构放在 `runtime::train` 是为了避免 `pending` 与 `respond::todo_flow` 互相依赖；
+/// 解析和格式化逻辑在 `respond::todo_flow::train_todo` 中维护。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrainTodoDraft {
+    /// 车次，例如 `G34`。
+    pub train_code: String,
+    /// 出发站名（用户输入或 LLM 归一化后的值）。
+    pub from_station: String,
+    /// 到达站名。
+    pub to_station: String,
+    /// 乘车日期（中国标准时间）。
+    pub travel_date: NaiveDate,
+    /// 座位号，可选。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    /// 站台，可选。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// 备注，可选。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// 校验后的出发时间（含跨日），确认写入时用于 Todo `due_at`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub departure_at: Option<String>,
+    /// 校验后的到达时间（含跨日）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrive_at: Option<String>,
+}
+
+impl TrainTodoDraft {
+    /// 根据校验结果填充出发/到达时间，返回新的草稿。
+    pub fn with_validation(mut self, validation: &TrainTripValidation) -> Self {
+        self.departure_at = Some(
+            validation
+                .departure_at
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        );
+        self.arrive_at = Some(validation.arrive_at.format("%Y-%m-%d %H:%M:%S").to_string());
+        self
+    }
+
+    /// 是否已经完成时刻校验。
+    pub fn is_validated(&self) -> bool {
+        self.departure_at.is_some() && self.arrive_at.is_some()
+    }
+}
+
+/// 火车行程校验结果，承载已确认的出发/到达站和对应时间。
+///
+/// 时间字段已经结合 `day_difference` 计算成完整的 `NaiveDateTime`（中国标准时间），
+/// 上层可直接用于 Todo 提醒，不需要再次处理跨日。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrainTripValidation {
+    /// 出发站经停信息（来自 12306 返回）。
+    pub from_stop: TrainStop,
+    /// 到达站经停信息。
+    pub to_stop: TrainStop,
+    /// 出发站的发车时间（含跨日）。
+    pub departure_at: NaiveDateTime,
+    /// 到达站的到达时间（含跨日）。
+    pub arrive_at: NaiveDateTime,
+}
+
+/// 火车行程校验失败原因。
+///
+/// 区分“站点不存在”、“站点顺序错误”等情况，便于上层给出针对性提示，
+/// 而不是统一报“车次不存在”。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrainTripError {
+    /// 出发站不在经停站列表中。
+    FromStationNotFound { station: String },
+    /// 到达站不在经停站列表中。
+    ToStationNotFound { station: String },
+    /// 出发站位于到达站之后，方向错误。
+    StationOrderReversed {
+        from_station: String,
+        to_station: String,
+    },
+    /// 出发站和到达站解析到同一个经停站。
+    SameStation { station: String },
+    /// 出发站缺少发车时间（理论上始发站也会有发车时间，缺失说明数据异常）。
+    MissingDepartureTime { station: String },
+    /// 到达站缺少到达时间。
+    MissingArriveTime { station: String },
+    /// 12306 返回了无法解析的时间字段。
+    InvalidTime {
+        station: String,
+        field: &'static str,
+        value: String,
+    },
+    /// 12306 返回了异常的跨日字段。
+    InvalidDayDifference {
+        station: String,
+        day_difference: String,
+    },
+    /// 计算后的到达时间早于出发时间，说明候选日期或接口数据不可信。
+    ArrivalBeforeDeparture {
+        departure_at: String,
+        arrive_at: String,
+    },
+}
+
+/// 校验火车行程并计算出发/到达时间。
+///
+/// 步骤：
+/// 1. 在经停站中找到出发站和到达站；
+/// 2. 校验出发站位于到达站之前；
+/// 3. 读取出发站 `startTime` 和到达站 `arriveTime`；
+/// 4. 结合各自 `day_difference` 计算完整 `NaiveDateTime`。
+///
+/// 跨日计算以 `schedule.travel_date` 为列车始发日基准，`day_difference`
+/// 表示相对该始发日的偏移天数。上层如果拿到的是“用户上车日期”，需要先
+/// 选择能让出发站实际日期对齐的候选始发日，不能直接把两者混用。
+pub fn validate_train_trip(
+    schedule: &TrainSchedule,
+    from_station: &str,
+    to_station: &str,
+) -> Result<TrainTripValidation, TrainTripError> {
+    let from_stop = find_stop_by_name(schedule, from_station).ok_or_else(|| {
+        TrainTripError::FromStationNotFound {
+            station: from_station.to_owned(),
+        }
+    })?;
+    let to_stop = find_stop_by_name(schedule, to_station).ok_or_else(|| {
+        TrainTripError::ToStationNotFound {
+            station: to_station.to_owned(),
+        }
+    })?;
+    if from_stop.station_no == to_stop.station_no {
+        return Err(TrainTripError::SameStation {
+            station: from_stop.station_name.clone(),
+        });
+    }
+    if from_stop.station_no > to_stop.station_no {
+        return Err(TrainTripError::StationOrderReversed {
+            from_station: from_station.to_owned(),
+            to_station: to_station.to_owned(),
+        });
+    }
+    let departure_time = from_stop.departure_time.as_deref().ok_or_else(|| {
+        TrainTripError::MissingDepartureTime {
+            station: from_stop.station_name.clone(),
+        }
+    })?;
+    let arrive_time =
+        to_stop
+            .arrive_time
+            .as_deref()
+            .ok_or_else(|| TrainTripError::MissingArriveTime {
+                station: to_stop.station_name.clone(),
+            })?;
+    // Provider 层会把缺失/非法 `dayDifference` 兜底成 0 以保住 `/火车` 查询展示，
+    // 但火车 Todo 需要写入绝对提醒时间，不能把这种不可信数据当作“当天”继续计算。
+    let from_day_difference = ensure_reliable_day_difference(from_stop)?;
+    let to_day_difference = ensure_reliable_day_difference(to_stop)?;
+    let departure_at = compose_train_datetime(
+        schedule.travel_date,
+        departure_time,
+        from_day_difference,
+        &from_stop.station_name,
+        "startTime",
+    )?;
+    let arrive_at = compose_train_datetime(
+        schedule.travel_date,
+        arrive_time,
+        to_day_difference,
+        &to_stop.station_name,
+        "arriveTime",
+    )?;
+    if arrive_at < departure_at {
+        return Err(TrainTripError::ArrivalBeforeDeparture {
+            departure_at: departure_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            arrive_at: arrive_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        });
+    }
+    Ok(TrainTripValidation {
+        from_stop: from_stop.clone(),
+        to_stop: to_stop.clone(),
+        departure_at,
+        arrive_at,
+    })
+}
+
+fn ensure_reliable_day_difference(stop: &TrainStop) -> Result<i32, TrainTripError> {
+    if stop.day_difference_reliable {
+        return Ok(stop.day_difference);
+    }
+    Err(TrainTripError::InvalidDayDifference {
+        station: stop.station_name.clone(),
+        day_difference: "缺失或非法".to_owned(),
+    })
+}
+
+/// 把 `HH:MM` / `HH:MM:SS` 时间和 `day_difference` 组合成完整的 `NaiveDateTime`。
+///
+/// 时间字段和跨日字段都来自 12306。任何异常都必须显式报错，不能兜底为
+/// `00:00` 或当天日期，否则会写入错误提醒。
+fn compose_train_datetime(
+    base_date: NaiveDate,
+    value: &str,
+    day_difference: i32,
+    station: &str,
+    field: &'static str,
+) -> Result<NaiveDateTime, TrainTripError> {
+    if day_difference < 0 {
+        return Err(TrainTripError::InvalidDayDifference {
+            station: station.to_owned(),
+            day_difference: day_difference.to_string(),
+        });
+    }
+    let time = parse_train_time(value).ok_or_else(|| TrainTripError::InvalidTime {
+        station: station.to_owned(),
+        field,
+        value: value.to_owned(),
+    })?;
+    let date = base_date + chrono::Duration::days(day_difference as i64);
+    Ok(NaiveDateTime::new(date, time))
+}
+
+/// 严格解析 12306 时间字段。
+///
+/// 当前接口常见格式为 `HH:MM`；部分接口或未来变化可能返回 `HH:MM:SS`，
+/// 这里明确支持秒字段，但不做截断、不使用默认值。
+fn parse_train_time(value: &str) -> Option<NaiveTime> {
+    let value = value.trim();
+    if value.is_empty() || matches!(value, "--" | "----" | "--:--") {
+        return None;
+    }
+    let parts = value.split(':').collect::<Vec<_>>();
+    let [hour, minute] = parts.as_slice() else {
+        let [hour, minute, second] = parts.as_slice() else {
+            return None;
+        };
+        let hour = parse_fixed_width_time_part(hour)?;
+        let minute = parse_fixed_width_time_part(minute)?;
+        let second = parse_fixed_width_time_part(second)?;
+        return NaiveTime::from_hms_opt(hour, minute, second);
+    };
+    let hour = parse_fixed_width_time_part(hour)?;
+    let minute = parse_fixed_width_time_part(minute)?;
+    NaiveTime::from_hms_opt(hour, minute, 0)
+}
+
+fn parse_fixed_width_time_part(value: &str) -> Option<u32> {
+    (value.len() == 2 && value.chars().all(|ch| ch.is_ascii_digit()))
+        .then(|| value.parse::<u32>().ok())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_schedule() -> TrainSchedule {
+        TrainSchedule {
+            train_code: "G34".to_owned(),
+            travel_date: NaiveDate::from_ymd_opt(2026, 6, 24).unwrap(),
+            start_station: "杭州东".to_owned(),
+            end_station: "北京南".to_owned(),
+            stops: vec![
+                TrainStop {
+                    station_no: 1,
+                    station_name: "杭州东".to_owned(),
+                    arrive_time: None,
+                    departure_time: Some("07:05".to_owned()),
+                    stopover_minutes: None,
+                    day_difference: 0,
+                    day_difference_reliable: true,
+                    station_train_code: "G34".to_owned(),
+                },
+                TrainStop {
+                    station_no: 2,
+                    station_name: "南京南".to_owned(),
+                    arrive_time: Some("09:20".to_owned()),
+                    departure_time: Some("09:22".to_owned()),
+                    stopover_minutes: Some(2),
+                    day_difference: 0,
+                    day_difference_reliable: true,
+                    station_train_code: "G34".to_owned(),
+                },
+                TrainStop {
+                    station_no: 3,
+                    station_name: "北京南".to_owned(),
+                    arrive_time: Some("11:40".to_owned()),
+                    departure_time: None,
+                    stopover_minutes: None,
+                    day_difference: 0,
+                    day_difference_reliable: true,
+                    station_train_code: "G34".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn cross_day_schedule() -> TrainSchedule {
+        TrainSchedule {
+            train_code: "Z281".to_owned(),
+            travel_date: NaiveDate::from_ymd_opt(2026, 6, 24).unwrap(),
+            start_station: "杭州".to_owned(),
+            end_station: "西安".to_owned(),
+            stops: vec![
+                TrainStop {
+                    station_no: 1,
+                    station_name: "杭州".to_owned(),
+                    arrive_time: None,
+                    departure_time: Some("23:40".to_owned()),
+                    stopover_minutes: None,
+                    day_difference: 0,
+                    day_difference_reliable: true,
+                    station_train_code: "Z281".to_owned(),
+                },
+                TrainStop {
+                    station_no: 5,
+                    station_name: "西安".to_owned(),
+                    arrive_time: Some("08:15".to_owned()),
+                    departure_time: None,
+                    stopover_minutes: None,
+                    day_difference: 1,
+                    day_difference_reliable: true,
+                    station_train_code: "Z281".to_owned(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn normalize_station_name_strips_trailing_suffix() {
+        assert_eq!(normalize_station_name("杭州东站"), "杭州东");
+        assert_eq!(normalize_station_name("杭州东"), "杭州东");
+        assert_eq!(normalize_station_name(" 杭州 "), "杭州");
+    }
+
+    #[test]
+    fn find_stop_matches_with_or_without_suffix() {
+        let schedule = sample_schedule();
+        assert!(find_stop_by_name(&schedule, "杭州东站").is_some());
+        assert!(find_stop_by_name(&schedule, "杭州东").is_some());
+        assert!(find_stop_by_name(&schedule, "上海").is_none());
+    }
+
+    #[test]
+    fn validate_trip_returns_times_for_same_day() {
+        let schedule = sample_schedule();
+        let trip = validate_train_trip(&schedule, "杭州东", "北京南").unwrap();
+        assert_eq!(
+            trip.departure_at,
+            NaiveDate::from_ymd_opt(2026, 6, 24)
+                .unwrap()
+                .and_hms_opt(7, 5, 0)
+                .unwrap()
+        );
+        assert_eq!(
+            trip.arrive_at,
+            NaiveDate::from_ymd_opt(2026, 6, 24)
+                .unwrap()
+                .and_hms_opt(11, 40, 0)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn validate_trip_returns_times_for_midway_same_day_boarding() {
+        let schedule = sample_schedule();
+        let trip = validate_train_trip(&schedule, "南京南", "北京南").unwrap();
+        assert_eq!(
+            trip.departure_at,
+            NaiveDate::from_ymd_opt(2026, 6, 24)
+                .unwrap()
+                .and_hms_opt(9, 22, 0)
+                .unwrap()
+        );
+        assert_eq!(
+            trip.arrive_at,
+            NaiveDate::from_ymd_opt(2026, 6, 24)
+                .unwrap()
+                .and_hms_opt(11, 40, 0)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn validate_trip_handles_cross_day_arrival() {
+        let schedule = cross_day_schedule();
+        let trip = validate_train_trip(&schedule, "杭州", "西安").unwrap();
+        assert_eq!(
+            trip.departure_at,
+            NaiveDate::from_ymd_opt(2026, 6, 24)
+                .unwrap()
+                .and_hms_opt(23, 40, 0)
+                .unwrap()
+        );
+        assert_eq!(
+            trip.arrive_at,
+            NaiveDate::from_ymd_opt(2026, 6, 25)
+                .unwrap()
+                .and_hms_opt(8, 15, 0)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn validate_trip_rejects_missing_from_station() {
+        let schedule = sample_schedule();
+        assert_eq!(
+            validate_train_trip(&schedule, "上海", "北京南").unwrap_err(),
+            TrainTripError::FromStationNotFound {
+                station: "上海".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn validate_trip_rejects_missing_to_station() {
+        let schedule = sample_schedule();
+        assert_eq!(
+            validate_train_trip(&schedule, "杭州东", "上海").unwrap_err(),
+            TrainTripError::ToStationNotFound {
+                station: "上海".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn validate_trip_rejects_reversed_order() {
+        let schedule = sample_schedule();
+        assert_eq!(
+            validate_train_trip(&schedule, "北京南", "杭州东").unwrap_err(),
+            TrainTripError::StationOrderReversed {
+                from_station: "北京南".to_owned(),
+                to_station: "杭州东".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn validate_trip_rejects_same_station() {
+        let schedule = sample_schedule();
+        assert_eq!(
+            validate_train_trip(&schedule, "南京南", "南京南").unwrap_err(),
+            TrainTripError::SameStation {
+                station: "南京南".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_train_time_accepts_hhmm_and_hhmmss() {
+        assert_eq!(
+            parse_train_time("07:05").unwrap(),
+            NaiveTime::from_hms_opt(7, 5, 0).unwrap()
+        );
+        assert_eq!(
+            parse_train_time("07:05:30").unwrap(),
+            NaiveTime::from_hms_opt(7, 5, 30).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_train_time_rejects_empty_placeholder_and_invalid_values() {
+        assert!(parse_train_time("").is_none());
+        assert!(parse_train_time("--").is_none());
+        assert!(parse_train_time("--:--").is_none());
+        assert!(parse_train_time("25:00").is_none());
+        assert!(parse_train_time("07:65").is_none());
+        assert!(parse_train_time("7:05").is_none());
+    }
+
+    #[test]
+    fn validate_trip_rejects_invalid_time_without_midnight_fallback() {
+        let mut schedule = sample_schedule();
+        schedule.stops[0].departure_time = Some("25:99".to_owned());
+        assert_eq!(
+            validate_train_trip(&schedule, "杭州东", "北京南").unwrap_err(),
+            TrainTripError::InvalidTime {
+                station: "杭州东".to_owned(),
+                field: "startTime",
+                value: "25:99".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn validate_trip_rejects_unreliable_day_difference_without_same_day_fallback() {
+        let mut schedule = cross_day_schedule();
+        schedule.stops[1].day_difference = 0;
+        schedule.stops[1].day_difference_reliable = false;
+        assert_eq!(
+            validate_train_trip(&schedule, "杭州", "西安").unwrap_err(),
+            TrainTripError::InvalidDayDifference {
+                station: "西安".to_owned(),
+                day_difference: "缺失或非法".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn validate_trip_rejects_arrival_before_departure() {
+        let mut schedule = sample_schedule();
+        schedule.stops[0].departure_time = Some("12:00".to_owned());
+        schedule.stops[2].arrive_time = Some("11:00".to_owned());
+        assert!(matches!(
+            validate_train_trip(&schedule, "杭州东", "北京南").unwrap_err(),
+            TrainTripError::ArrivalBeforeDeparture { .. }
+        ));
+    }
+
+    #[test]
+    fn train_api_response_falls_back_for_missing_station_fields() {
+        let schedule = TrainApiResponse {
+            status: true,
+            error_msg: String::new(),
+            data: Some(TrainApiData {
+                train_detail: Some(TrainApiDetail {
+                    train_code: Some("1461".to_owned()),
+                    stop_time: vec![
+                        TrainApiStop {
+                            station_no: None,
+                            station_name: Some("北京".to_owned()),
+                            arrive_time: Some("----".to_owned()),
+                            start_time: Some("16:00".to_owned()),
+                            stopover_time: None,
+                            day_difference: None,
+                            station_train_code: None,
+                        },
+                        TrainApiStop {
+                            station_no: Some(String::new()),
+                            station_name: Some("上海".to_owned()),
+                            arrive_time: Some("08:10".to_owned()),
+                            start_time: Some("----".to_owned()),
+                            stopover_time: Some("5".to_owned()),
+                            day_difference: Some(String::new()),
+                            station_train_code: Some("1461".to_owned()),
+                        },
+                    ],
+                }),
+            }),
+        }
+        .into_schedule(TrainScheduleRequest {
+            train_code: "1461".to_owned(),
+            travel_date: NaiveDate::from_ymd_opt(2026, 6, 24).unwrap(),
+        })
+        .unwrap();
+
+        assert_eq!(schedule.stops[0].station_no, 1);
+        assert_eq!(schedule.stops[0].day_difference, 0);
+        assert!(!schedule.stops[0].day_difference_reliable);
+        assert_eq!(schedule.stops[1].station_no, 2);
+        assert_eq!(schedule.stops[1].day_difference, 0);
+        assert!(!schedule.stops[1].day_difference_reliable);
+    }
+
+    #[test]
+    fn train_api_response_falls_back_for_invalid_station_fields() {
+        let schedule = TrainApiResponse {
+            status: true,
+            error_msg: String::new(),
+            data: Some(TrainApiData {
+                train_detail: Some(TrainApiDetail {
+                    train_code: Some("1461".to_owned()),
+                    stop_time: vec![TrainApiStop {
+                        station_no: Some("A01".to_owned()),
+                        station_name: Some("蚌埠".to_owned()),
+                        arrive_time: Some("00:47".to_owned()),
+                        start_time: Some("00:51".to_owned()),
+                        stopover_time: Some("4".to_owned()),
+                        day_difference: Some("oops".to_owned()),
+                        station_train_code: Some("1461".to_owned()),
+                    }],
+                }),
+            }),
+        }
+        .into_schedule(TrainScheduleRequest {
+            train_code: "1461".to_owned(),
+            travel_date: NaiveDate::from_ymd_opt(2026, 6, 24).unwrap(),
+        })
+        .unwrap();
+
+        assert_eq!(schedule.stops[0].station_no, 1);
+        assert_eq!(schedule.stops[0].day_difference, 0);
+        assert!(!schedule.stops[0].day_difference_reliable);
+    }
+
+    #[test]
+    fn train_api_response_accepts_numeric_station_fields() {
+        let response = serde_json::from_value::<TrainApiResponse>(serde_json::json!({
+            "status": true,
+            "errorMsg": "",
+            "data": {
+                "trainDetail": {
+                    "trainCode": "1461",
+                    "stopTime": [
+                        {
+                            "stationNo": 16,
+                            "stationName": "蚌埠",
+                            "arriveTime": "00:47",
+                            "startTime": "00:51",
+                            "stopover_time": "4",
+                            "dayDifference": 1,
+                            "stationTrainCode": "1461"
+                        }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        let schedule = response
+            .into_schedule(TrainScheduleRequest {
+                train_code: "1461".to_owned(),
+                travel_date: NaiveDate::from_ymd_opt(2026, 6, 24).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(schedule.stops[0].station_no, 16);
+        assert_eq!(schedule.stops[0].day_difference, 1);
+        assert!(schedule.stops[0].day_difference_reliable);
+    }
 }
