@@ -104,8 +104,9 @@ struct RawGroupMessage {
     id: Option<String>,
     #[serde(default)]
     event_id: Option<String>,
-    #[serde(default, alias = "group_id")]
     group_openid: Option<String>,
+    #[serde(default)]
+    group_id: Option<String>,
     #[serde(default)]
     author: Option<RawAuthor>,
     #[serde(default, alias = "member_openid")]
@@ -220,8 +221,11 @@ pub fn parse_group_message(envelope: &GatewayEnvelope) -> Result<Option<GroupMes
         .or(raw.event_id)
         .filter(|value| !value.trim().is_empty())
         .ok_or(EventError::MissingMessageId)?;
+    // QQ 群事件在不同阶段可能同时携带 `group_openid` 和旧字段 `group_id`；
+    // 这里手动合并，避免直接用 serde alias 时命中 duplicate field 报错。
     let group_openid = raw
         .group_openid
+        .or(raw.group_id)
         .filter(|value| !value.trim().is_empty())
         .ok_or(EventError::MissingGroupOpenid)?;
     let author = raw.author;
@@ -446,6 +450,50 @@ mod tests {
         let message = parse_group_message(&envelope).unwrap().unwrap();
 
         assert_eq!(message.group_openid, "group-1");
+        assert_eq!(message.member_openid.as_deref(), Some("member-1"));
+    }
+
+    #[test]
+    fn parses_group_message_from_legacy_group_id_field() {
+        let envelope = GatewayEnvelope {
+            op: 0,
+            s: Some(42),
+            t: Some(EVENT_GROUP_MESSAGE_CREATE.to_owned()),
+            id: None,
+            d: json!({
+                "id": "msg-legacy",
+                "group_id": "group-legacy",
+                "author": {"member_openid": "member-1"},
+                "content": "hello"
+            }),
+        };
+
+        let message = parse_group_message(&envelope).unwrap().unwrap();
+
+        assert_eq!(message.group_openid, "group-legacy");
+        assert_eq!(message.member_openid.as_deref(), Some("member-1"));
+    }
+
+    #[test]
+    fn prefers_group_openid_when_group_id_is_also_present() {
+        // QQ API 兼容期内可能同时下发新旧群字段，主字段应优先使用 group_openid。
+        let envelope = GatewayEnvelope {
+            op: 0,
+            s: Some(42),
+            t: Some(EVENT_GROUP_AT_MESSAGE_CREATE.to_owned()),
+            id: None,
+            d: json!({
+                "id": "msg-both-group-fields",
+                "group_openid": "group-new",
+                "group_id": "group-old",
+                "author": {"member_openid": "member-1"},
+                "content": "hello"
+            }),
+        };
+
+        let message = parse_group_message(&envelope).unwrap().unwrap();
+
+        assert_eq!(message.group_openid, "group-new");
         assert_eq!(message.member_openid.as_deref(), Some("member-1"));
     }
 
