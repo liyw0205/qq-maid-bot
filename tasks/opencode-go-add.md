@@ -403,7 +403,7 @@ OpenCode Go 默认只进入普通聊天链路。
 
 至少同步更新：
 
-* `runtime/.env.example`：增加 OpenCode Go 和 `CHAT_MODEL_ROUTE` 示例；
+* `runtime/.env.example`：实现并接线 `CHAT_MODEL_ROUTE` 后，再增加 OpenCode Go 和 `CHAT_MODEL_ROUTE` 示例；
 * `qq-maid-core/README.md`：说明 `CHAT_MODEL_ROUTE`、`LLM_MODEL` 和内部任务模型的关系；
 * `qq-maid-llm/README.md`：说明新增 provider 前缀和启动期 route 校验。
 
@@ -420,7 +420,7 @@ OpenCode Go 默认只进入普通聊天链路。
 * [ ] 可以允许全部群或指定群；
 * [ ] 图片等附件继续按现有文本备注链路处理；
 * [ ] 命令和后台任务不受影响；
-* [ ] OpenCode Go 失败后自动 fallback；
+* [ ] OpenCode Go 的可恢复失败会自动 fallback；401/403 鉴权错误作为配置错误暴露，不 fallback；
 * [ ] API Key 不出现在日志中；
 * [ ] 不复制已有 HTTP/SSE 实现；
 * [ ] 默认关闭时行为与修改前一致；
