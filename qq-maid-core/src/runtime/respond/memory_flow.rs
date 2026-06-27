@@ -1038,14 +1038,13 @@ fn resolve_memory_target(
     if target.chars().all(|ch| ch.is_ascii_digit())
         && let Ok(index) = target.parse::<usize>()
     {
-        if let Some(query) = valid_last_memory_query(session, command_scope) {
-            if let Some(id) = query
+        if let Some(query) = valid_last_memory_query(session, command_scope)
+            && let Some(id) = query
                 .result_ids
                 .get(index.saturating_sub(1))
                 .filter(|_| index > 0)
-            {
-                return MemoryTarget::ResolvedId(id.clone());
-            }
+        {
+            return MemoryTarget::ResolvedId(id.clone());
         }
         return MemoryTarget::MissingListIndex(index);
     }
