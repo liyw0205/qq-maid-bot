@@ -11,10 +11,7 @@ use crate::{
     error::LlmError,
     runtime::{
         command::{ParsedCommand, parse_slash_command},
-        memory::{
-            CreateScopedMemoryRequest, MemoryActor, MemoryRecord, MemoryScopeType,
-            ScopedMemoryQuery, UpdateMemoryRequest,
-        },
+        memory::{CreateMemoryRequest, ListMemoryQuery, MemoryRecord, UpdateMemoryRequest},
         pending::{
             PendingMemory, PendingMemoryDelete, PendingMemoryUpdate, PendingOperation,
             PendingReplyKind, classify_reply, memory_lexicon, pending_revision_failed_reply,
@@ -42,8 +39,6 @@ const MEMORY_DRAFT_LEGACY_USAGE_REPLY: &str = "/zy 仍可使用，但推荐改�
 // 非斜杠开头的"记一下"等旧版语法的提示
 const MEMORY_LEGACY_HINT_REPLY: &str = "长期记忆请使用：/memory 要保存的内容
 也可以使用：/记忆 要保存的内容";
-const MEMORY_GROUP_PRIVATE_REJECT_REPLY: &str = "群记忆只能在群聊中查看或管理。";
-const MEMORY_SCOPE_MISMATCH_REPLY: &str = "这条记忆不在当前可管理范围内。";
 
 /// 记忆操作目标：通过列表序号解析出的真实 ID 或无效序号。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,14 +47,6 @@ enum MemoryTarget {
     ResolvedId(String),
     /// 列表序号超出范围，记录序号用于错误提示
     MissingListIndex(usize),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MemoryCommandScope {
-    scope_type: MemoryScopeType,
-    scope_id: String,
-    label: &'static str,
-    group_command: bool,
 }
 
 impl RustRespondService {
@@ -82,16 +69,7 @@ impl RustRespondService {
         }
 
         if let Some(command) = parse_memory_draft_command(user_text) {
-            let Some(command_scope) = memory_command_scope(&command, meta) else {
-                return Ok(Some(self.append_pending_response(
-                    session,
-                    user_text,
-                    MEMORY_GROUP_PRIVATE_REJECT_REPLY,
-                    command.action,
-                )?));
-            };
-            let draft_argument = memory_draft_argument(&command);
-            let argument = draft_argument.trim();
+            let argument = command.argument.trim();
             if argument.is_empty() {
                 let (reply, action) = if command.raw_command == "zy" {
                     (
@@ -101,22 +79,14 @@ impl RustRespondService {
                 } else {
                     let records = self
                         .memory_store
-                        .list_scoped(ScopedMemoryQuery {
-                            scope_type: command_scope.scope_type,
-                            scope_id: command_scope.scope_id.clone(),
+                        .list(ListMemoryQuery {
                             limit: Some(MEMORY_LIST_LIMIT),
-                            q: None,
-                            scope: None,
-                            memory_type: None,
+                            ..Default::default()
                         })
                         .map_err(memory_error)?;
-                    remember_memory_query(session, "list", "", &command_scope, &records);
+                    remember_memory_query(session, "list", "", &records);
                     (
-                        structured_command_body(format_memory_list_reply(
-                            &records,
-                            "",
-                            &command_scope,
-                        )),
+                        structured_command_body(format_memory_list_reply(&records, "")),
                         "memory_list",
                     )
                 };
@@ -134,7 +104,7 @@ impl RustRespondService {
             }
 
             let Some(memory) = self
-                .build_pending_memory_create(argument, user_text, session, &command_scope, meta)
+                .build_pending_memory_create(argument, user_text, session)
                 .await?
             else {
                 return Ok(Some(self.append_pending_response(
@@ -176,13 +146,11 @@ impl RustRespondService {
         draft_input: &str,
         source_text: &str,
         session: &SessionRecord,
-        command_scope: &MemoryCommandScope,
-        meta: &SessionMeta,
     ) -> Result<Option<PendingMemory>, LlmError> {
         if contains_sensitive_text(draft_input) {
             return Ok(None);
         }
-        let memory_context = self.build_memory_context(meta)?;
+        let memory_context = self.build_memory_context()?;
         let session_context = build_session_context(session);
         let service = LlmChatService::new(self.provider.clone());
         let output = service
@@ -200,7 +168,7 @@ impl RustRespondService {
                 ..empty_respond_request()
             })
             .await?;
-        self.build_pending_memory_from_output(&output.reply, source_text, command_scope)
+        self.build_pending_memory_from_output(&output.reply, source_text)
     }
 
     /// 从 LLM 输出中解析验证记忆内容，构造待确认记忆结构体。
@@ -208,7 +176,6 @@ impl RustRespondService {
         &self,
         raw_output: &str,
         source_text: &str,
-        command_scope: &MemoryCommandScope,
     ) -> Result<Option<PendingMemory>, LlmError> {
         let Some(draft) = parse_valid_memory_draft_content(raw_output) else {
             return Ok(None);
@@ -221,8 +188,6 @@ impl RustRespondService {
             memory_type,
             scope,
             created_at: now_iso_cn(),
-            target_scope_type: Some(command_scope.scope_type.as_str().to_owned()),
-            target_scope_id: Some(command_scope.scope_id.clone()),
         }))
     }
 
@@ -256,8 +221,6 @@ impl RustRespondService {
             memory_type,
             scope,
             created_at: now_iso_cn(),
-            target_scope_type: current.target_scope_type.clone(),
-            target_scope_id: current.target_scope_id.clone(),
         }))
     }
 
@@ -294,8 +257,6 @@ impl RustRespondService {
             memory_type: current.memory_type.clone(),
             scope: current.scope.clone(),
             created_at: now_iso_cn(),
-            target_scope_type: current.target_scope_type.clone(),
-            target_scope_id: current.target_scope_id.clone(),
         }))
     }
 
@@ -359,28 +320,9 @@ impl RustRespondService {
                     )?));
                 }
                 if matches!(reply_kind, PendingReplyKind::Confirm) {
-                    let Some(command_scope) = pending_memory_scope(&memory, meta) else {
-                        return Ok(Some(self.append_pending_response(
-                            session,
-                            user_text,
-                            MEMORY_SCOPE_MISMATCH_REPLY,
-                            "memory",
-                        )?));
-                    };
-                    let Some(actor) = memory_actor(meta) else {
-                        return Ok(Some(self.append_pending_response(
-                            session,
-                            user_text,
-                            "当前请求缺少稳定用户标识，不能写入长期记忆。",
-                            "memory",
-                        )?));
-                    };
                     let created = self
                         .memory_store
-                        .create_scoped(CreateScopedMemoryRequest {
-                            scope_type: command_scope.scope_type,
-                            scope_id: command_scope.scope_id,
-                            created_by_user_id: actor.user_id,
+                        .create(CreateMemoryRequest {
                             user_id: meta.user_id.clone(),
                             group_id: meta.group_id.clone(),
                             content: memory.content,
@@ -440,29 +382,10 @@ impl RustRespondService {
                     )?));
                 }
                 if matches!(reply_kind, PendingReplyKind::Confirm) {
-                    let Some(command_scope) = pending_update_scope(&update, meta) else {
-                        return Ok(Some(self.append_pending_response(
-                            session,
-                            user_text,
-                            MEMORY_SCOPE_MISMATCH_REPLY,
-                            "memory_update",
-                        )?));
-                    };
-                    let Some(actor) = memory_actor(meta) else {
-                        return Ok(Some(self.append_pending_response(
-                            session,
-                            user_text,
-                            "当前请求缺少稳定用户标识，不能修改长期记忆。",
-                            "memory_update",
-                        )?));
-                    };
                     let updated = self
                         .memory_store
-                        .update_scoped(
-                            command_scope.scope_type,
-                            &command_scope.scope_id,
+                        .update(
                             &update.id,
-                            &actor,
                             UpdateMemoryRequest {
                                 content: Some(update.content),
                                 source_text: None,
@@ -526,31 +449,7 @@ impl RustRespondService {
                     )?));
                 }
                 if matches!(reply_kind, PendingReplyKind::Confirm) {
-                    let Some(command_scope) = pending_delete_scope(&delete, meta) else {
-                        return Ok(Some(self.append_pending_response(
-                            session,
-                            user_text,
-                            MEMORY_SCOPE_MISMATCH_REPLY,
-                            "memory_delete",
-                        )?));
-                    };
-                    let Some(actor) = memory_actor(meta) else {
-                        return Ok(Some(self.append_pending_response(
-                            session,
-                            user_text,
-                            "当前请求缺少稳定用户标识，不能删除长期记忆。",
-                            "memory_delete",
-                        )?));
-                    };
-                    let deleted = self
-                        .memory_store
-                        .delete_scoped(
-                            command_scope.scope_type,
-                            &command_scope.scope_id,
-                            &delete.id,
-                            &actor,
-                        )
-                        .map_err(memory_error)?;
+                    let deleted = self.memory_store.delete(&delete.id).map_err(memory_error)?;
                     let reply = format!("已删除记忆：{}", short_memory_id(&deleted));
                     return Ok(Some(self.clear_pending_response(
                         session,
@@ -578,38 +477,28 @@ impl RustRespondService {
         meta: &SessionMeta,
         session: &mut SessionRecord,
     ) -> Result<super::common::CommandBody, LlmError> {
-        let Some(command_scope) = memory_command_scope(command, meta) else {
-            return Ok(MEMORY_GROUP_PRIVATE_REJECT_REPLY.into());
-        };
-        let scoped_argument = memory_scoped_argument(command);
-        let argument = scoped_argument.trim();
+        let argument = command.argument.trim();
         match command.action.as_str() {
             "memory_list" => {
                 let records = self
                     .memory_store
-                    .list_scoped(ScopedMemoryQuery {
-                        scope_type: command_scope.scope_type,
-                        scope_id: command_scope.scope_id.clone(),
+                    .list(ListMemoryQuery {
                         limit: Some(MEMORY_LIST_LIMIT),
                         q: clean_string(argument.to_owned()),
-                        scope: None,
-                        memory_type: None,
+                        ..Default::default()
                     })
                     .map_err(memory_error)?;
-                remember_memory_query(session, "list", argument, &command_scope, &records);
+                remember_memory_query(session, "list", argument, &records);
                 Ok(structured_command_body(format_memory_list_reply(
-                    &records,
-                    argument,
-                    &command_scope,
+                    &records, argument,
                 )))
             }
             "memory_show" => {
                 if argument.is_empty() {
                     return Ok("用法：/memory show 列表序号".into());
                 }
-                let Some(record) = self.resolve_memory_record(session, &command_scope, argument)?
-                else {
-                    return Ok(format_memory_no_list_index_reply(argument, &command_scope).into());
+                let Some(record) = self.resolve_memory_record(session, argument)? else {
+                    return Ok(format_memory_no_list_index_reply(argument).into());
                 };
                 Ok(structured_command_body(format_memory_detail_reply(&record)))
             }
@@ -621,9 +510,8 @@ impl RustRespondService {
                     return Ok("这段内容像是包含密钥、token 或其他敏感信息，不更新记忆。".into());
                 }
                 let (memory_type, scope) = classify_memory(&content);
-                let Some(record) = self.resolve_memory_record(session, &command_scope, &target)?
-                else {
-                    return Ok(format_memory_no_list_index_reply(&target, &command_scope).into());
+                let Some(record) = self.resolve_memory_record(session, &target)? else {
+                    return Ok(format_memory_no_list_index_reply(&target).into());
                 };
                 let update = PendingMemoryUpdate {
                     id: record.id.clone(),
@@ -632,8 +520,6 @@ impl RustRespondService {
                     memory_type,
                     scope,
                     created_at: now_iso_cn(),
-                    target_scope_type: Some(command_scope.scope_type.as_str().to_owned()),
-                    target_scope_id: Some(command_scope.scope_id.clone()),
                 };
                 let reply = format_memory_update_confirm(&record, &update);
                 session.pending_operation = Some(PendingOperation::MemoryUpdate {
@@ -646,9 +532,8 @@ impl RustRespondService {
                 if argument.is_empty() {
                     return Ok("用法：/memory delete 列表序号".into());
                 }
-                let Some(record) = self.resolve_memory_record(session, &command_scope, argument)?
-                else {
-                    return Ok(format_memory_no_list_index_reply(argument, &command_scope).into());
+                let Some(record) = self.resolve_memory_record(session, argument)? else {
+                    return Ok(format_memory_no_list_index_reply(argument).into());
                 };
                 session.pending_operation = Some(PendingOperation::MemoryDelete {
                     initiator_user_id: meta.user_id.clone(),
@@ -658,8 +543,6 @@ impl RustRespondService {
                         memory_type: record.memory_type.clone(),
                         scope: record.scope.clone(),
                         created_at: now_iso_cn(),
-                        target_scope_type: Some(command_scope.scope_type.as_str().to_owned()),
-                        target_scope_id: Some(command_scope.scope_id.clone()),
                     },
                 });
                 Ok(structured_command_body(format_memory_delete_confirm(
@@ -675,18 +558,14 @@ impl RustRespondService {
     fn resolve_memory_record(
         &self,
         session: &mut SessionRecord,
-        command_scope: &MemoryCommandScope,
         target: &str,
     ) -> Result<Option<MemoryRecord>, LlmError> {
-        let target = resolve_memory_target(session, command_scope, target);
+        let target = resolve_memory_target(session, target);
         let id = match target {
             MemoryTarget::ResolvedId(id) => id,
             MemoryTarget::MissingListIndex(_) => return Ok(None),
         };
-        self.memory_store
-            .get_scoped(command_scope.scope_type, &command_scope.scope_id, &id)
-            .map(Some)
-            .map_err(memory_error)
+        self.memory_store.get(&id).map(Some).map_err(memory_error)
     }
 }
 
@@ -701,209 +580,29 @@ fn parse_memory_management_command(text: &str) -> Option<ParsedCommand> {
     let command = parse_memory_draft_command(text)?;
     let mut parts = command.argument.splitn(2, char::is_whitespace);
     let subcommand = parts.next()?.trim().to_ascii_lowercase();
-    let (action, argument) = match subcommand.as_str() {
-        // group/群 是显式群记忆命名空间；其后的空参数按群列表处理。
-        "group" | "群" => {
-            let rest = parts.next().unwrap_or("").trim();
-            let mut group_parts = rest.splitn(2, char::is_whitespace);
-            let group_subcommand = group_parts.next().unwrap_or("").trim().to_ascii_lowercase();
-            match group_subcommand.as_str() {
-                "" | "list" | "ls" | "列表" | "search" | "find" | "搜索" => (
-                    "memory_list",
-                    group_argument(group_parts.next().unwrap_or("").trim()),
-                ),
-                "add" | "新增" | "添加" => {
-                    return None;
-                }
-                "show" | "get" | "查看" | "详情" => (
-                    "memory_show",
-                    group_argument(group_parts.next().unwrap_or("").trim()),
-                ),
-                "edit" | "set" | "修改" | "改" => (
-                    "memory_edit",
-                    group_argument(group_parts.next().unwrap_or("").trim()),
-                ),
-                "update" | "更新" => ("memory_update_hint", group_argument("")),
-                "delete" | "del" | "rm" | "删除" => (
-                    "memory_delete",
-                    group_argument(group_parts.next().unwrap_or("").trim()),
-                ),
-                _ => ("memory_list", group_argument(rest)),
-            }
-        }
-        "list" | "ls" | "列表" | "search" | "find" | "搜索" => {
-            ("memory_list", parts.next().unwrap_or("").trim().to_owned())
-        }
-        "show" | "get" | "查看" | "详情" => {
-            ("memory_show", parts.next().unwrap_or("").trim().to_owned())
-        }
-        "edit" | "set" | "修改" | "改" => {
-            ("memory_edit", parts.next().unwrap_or("").trim().to_owned())
-        }
-        "update" | "更新" => (
-            "memory_update_hint",
-            parts.next().unwrap_or("").trim().to_owned(),
-        ),
-        "delete" | "del" | "rm" | "删除" => (
-            "memory_delete",
-            parts.next().unwrap_or("").trim().to_owned(),
-        ),
+    let action = match subcommand.as_str() {
+        "list" | "ls" | "列表" | "search" | "find" | "搜索" => "memory_list",
+        "show" | "get" | "查看" | "详情" => "memory_show",
+        "edit" | "set" | "修改" | "改" => "memory_edit",
+        "update" | "更新" => "memory_update_hint",
+        "delete" | "del" | "rm" | "删除" => "memory_delete",
         _ => return None,
     };
     Some(ParsedCommand {
         action: action.to_owned(),
-        argument,
+        argument: parts.next().unwrap_or("").trim().to_owned(),
         raw_command: command.raw_command,
     })
 }
 
-fn memory_command_scope(command: &ParsedCommand, meta: &SessionMeta) -> Option<MemoryCommandScope> {
-    let group_command = memory_command_targets_group(command);
-    if group_command {
-        let group_id = clean_string(meta.group_id.clone()?)?;
-        return Some(MemoryCommandScope {
-            scope_type: MemoryScopeType::Group,
-            scope_id: group_id,
-            label: "群",
-            group_command: true,
-        });
-    }
-    let user_id = clean_string(meta.user_id.clone()?)?;
-    Some(MemoryCommandScope {
-        scope_type: MemoryScopeType::Personal,
-        scope_id: user_id,
-        label: "个人",
-        group_command: false,
-    })
-}
-
-fn memory_command_targets_group(command: &ParsedCommand) -> bool {
-    let argument = command.argument.trim_start();
-    argument == "group"
-        || argument == "群"
-        || argument.starts_with("group ")
-        || argument.starts_with("群 ")
-}
-
-fn memory_scoped_argument(command: &ParsedCommand) -> String {
-    let argument = command.argument.trim();
-    for prefix in ["group", "群"] {
-        if argument == prefix {
-            return String::new();
-        }
-        if let Some(rest) = argument.strip_prefix(&format!("{prefix} ")) {
-            return rest.trim().to_owned();
-        }
-    }
-    argument.to_owned()
-}
-
-fn memory_draft_argument(command: &ParsedCommand) -> String {
-    let argument = command.argument.trim();
-    for prefix in [
-        "group add",
-        "group 新增",
-        "group 添加",
-        "群 add",
-        "群 新增",
-        "群 添加",
-    ] {
-        if let Some(rest) = argument.strip_prefix(prefix) {
-            return rest.trim().to_owned();
-        }
-    }
-    argument.to_owned()
-}
-
-fn group_argument(argument: &str) -> String {
-    if argument.trim().is_empty() {
-        "group".to_owned()
-    } else {
-        format!("group {}", argument.trim())
-    }
-}
-
-fn pending_memory_scope(memory: &PendingMemory, meta: &SessionMeta) -> Option<MemoryCommandScope> {
-    pending_scope(
-        memory.target_scope_type.as_deref(),
-        memory.target_scope_id.as_deref(),
-        meta,
-    )
-}
-
-fn pending_update_scope(
-    update: &PendingMemoryUpdate,
-    meta: &SessionMeta,
-) -> Option<MemoryCommandScope> {
-    pending_scope(
-        update.target_scope_type.as_deref(),
-        update.target_scope_id.as_deref(),
-        meta,
-    )
-}
-
-fn pending_delete_scope(
-    delete: &PendingMemoryDelete,
-    meta: &SessionMeta,
-) -> Option<MemoryCommandScope> {
-    pending_scope(
-        delete.target_scope_type.as_deref(),
-        delete.target_scope_id.as_deref(),
-        meta,
-    )
-}
-
-fn pending_scope(
-    scope_type: Option<&str>,
-    scope_id: Option<&str>,
-    meta: &SessionMeta,
-) -> Option<MemoryCommandScope> {
-    let scope_type = match scope_type? {
-        "personal" => MemoryScopeType::Personal,
-        "group" => MemoryScopeType::Group,
-        _ => return None,
-    };
-    let scope_id = scope_id?.trim();
-    if scope_id.is_empty() {
-        return None;
-    }
-    match scope_type {
-        MemoryScopeType::Personal if meta.user_id.as_deref() == Some(scope_id) => {
-            Some(MemoryCommandScope {
-                scope_type,
-                scope_id: scope_id.to_owned(),
-                label: "个人",
-                group_command: false,
-            })
-        }
-        MemoryScopeType::Group if meta.group_id.as_deref() == Some(scope_id) => {
-            Some(MemoryCommandScope {
-                scope_type,
-                scope_id: scope_id.to_owned(),
-                label: "群",
-                group_command: true,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn memory_actor(meta: &SessionMeta) -> Option<MemoryActor> {
-    clean_string(meta.user_id.clone()?).map(|user_id| MemoryActor { user_id })
-}
-
-fn format_memory_list_reply(
-    records: &[MemoryRecord],
-    query: &str,
-    command_scope: &MemoryCommandScope,
-) -> String {
+fn format_memory_list_reply(records: &[MemoryRecord], query: &str) -> String {
     if records.is_empty() {
         if query.trim().is_empty() {
-            return format!("当前没有{}长期记忆。", command_scope.label);
+            return "当前没有长期记忆。".to_owned();
         }
-        return format!("没有找到匹配的{}长期记忆。", command_scope.label);
+        return "没有找到匹配的长期记忆。".to_owned();
     }
-    let mut rows = vec![format!("{}长期记忆：", command_scope.label)];
+    let mut rows = vec!["长期记忆：".to_owned()];
     for (index, record) in records.iter().enumerate() {
         rows.push(format!(
             "{}. {} [{}/{}] {}",
@@ -914,14 +613,7 @@ fn format_memory_list_reply(
             truncate_chars(&record.content, 80)
         ));
     }
-    let prefix = if command_scope.group_command {
-        "/memory group"
-    } else {
-        "/memory"
-    };
-    rows.push(format!(
-        "操作：{prefix} show 1；{prefix} edit 1 新内容；{prefix} delete 1"
-    ));
+    rows.push("操作：/memory show 1；/memory edit 1 新内容；/memory delete 1".to_owned());
     rows.join("\n")
 }
 
@@ -1016,55 +708,37 @@ fn remember_memory_query(
     session: &mut SessionRecord,
     query_type: impl Into<String>,
     condition: impl Into<String>,
-    command_scope: &MemoryCommandScope,
     records: &[MemoryRecord],
 ) {
     session.last_memory_query = Some(LastMemoryQuery {
         query_type: query_type.into(),
         condition: condition.into(),
-        scope_type: Some(command_scope.scope_type.as_str().to_owned()),
-        scope_id: Some(command_scope.scope_id.clone()),
         result_ids: records.iter().map(|record| record.id.clone()).collect(),
         created_at: now_iso_cn(),
     });
 }
 
-fn resolve_memory_target(
-    session: &mut SessionRecord,
-    command_scope: &MemoryCommandScope,
-    target: &str,
-) -> MemoryTarget {
+fn resolve_memory_target(session: &mut SessionRecord, target: &str) -> MemoryTarget {
     let target = target.split_whitespace().next().unwrap_or("").trim();
     if target.chars().all(|ch| ch.is_ascii_digit())
         && let Ok(index) = target.parse::<usize>()
+        && let Some(query) = valid_last_memory_query(session)
     {
-        if let Some(query) = valid_last_memory_query(session, command_scope) {
-            if let Some(id) = query
-                .result_ids
-                .get(index.saturating_sub(1))
-                .filter(|_| index > 0)
-            {
-                return MemoryTarget::ResolvedId(id.clone());
-            }
+        if let Some(id) = query
+            .result_ids
+            .get(index.saturating_sub(1))
+            .filter(|_| index > 0)
+        {
+            return MemoryTarget::ResolvedId(id.clone());
         }
         return MemoryTarget::MissingListIndex(index);
     }
     MemoryTarget::ResolvedId(target.to_owned())
 }
 
-fn valid_last_memory_query(
-    session: &mut SessionRecord,
-    command_scope: &MemoryCommandScope,
-) -> Option<LastMemoryQuery> {
+fn valid_last_memory_query(session: &mut SessionRecord) -> Option<LastMemoryQuery> {
     let query = session.last_memory_query.clone()?;
     if !matches!(query.query_type.as_str(), "list" | "search") {
-        return None;
-    }
-    // 旧会话快照没有 scope_type/scope_id。缺字段时强制重新列表，避免跨作用域复用序号。
-    if query.scope_type.as_deref() != Some(command_scope.scope_type.as_str())
-        || query.scope_id.as_deref() != Some(command_scope.scope_id.as_str())
-    {
-        session.last_memory_query = None;
         return None;
     }
     if !query_is_fresh(&query.created_at, LAST_QUERY_TTL_SECONDS) {
@@ -1074,15 +748,9 @@ fn valid_last_memory_query(
     Some(query)
 }
 
-fn format_memory_no_list_index_reply(target: &str, command_scope: &MemoryCommandScope) -> String {
-    let list_command = if command_scope.group_command {
-        "/memory group"
-    } else {
-        "/memory"
-    };
+fn format_memory_no_list_index_reply(target: &str) -> String {
     format!(
-        "最近的{}记忆列表里没有第 {} 条。请先发送 {list_command} 查看列表，再使用列表序号。",
-        command_scope.label,
+        "最近的记忆列表里没有第 {} 条。请先发送 /memory 查看列表，再使用列表序号。",
         target.trim()
     )
 }
