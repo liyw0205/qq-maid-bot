@@ -1170,15 +1170,35 @@ async fn todo_delete_uses_latest_all_snapshot_for_any_status() {
         .unwrap()
         .text
         .unwrap();
-    assert!(cancelled_confirm.contains("确认删除这条待办"));
+    assert!(cancelled_confirm.contains("确认删除这 1 条已取消待办？来源：全部待办第 2 条"));
+    assert!(!cancelled_confirm.contains("删除后会标记为已取消"));
     assert!(cancelled_confirm.contains("已取消完成"));
+    let session = service
+        .session_store
+        .get_or_create_active(&test_meta())
+        .unwrap();
+    match session.pending_operation {
+        Some(PendingOperation::TodoBulkDelete {
+            item_ids,
+            matched_count,
+            status,
+            source_condition,
+            ..
+        }) => {
+            assert_eq!(item_ids, vec!["5".to_owned()]);
+            assert_eq!(matched_count, 1);
+            assert_eq!(status, TodoStatus::Cancelled);
+            assert_eq!(source_condition, "全部待办第 2 条");
+        }
+        other => panic!("unexpected pending operation: {other:?}"),
+    }
     let deleted = service
         .respond(message("确认"))
         .await
         .unwrap()
         .text
         .unwrap();
-    assert!(deleted.contains("已删除待办：已取消完成"));
+    assert!(deleted.contains("已删除 1 条已取消待办。来源：全部待办第 2 条"));
     assert!(
         service
             .todo_store

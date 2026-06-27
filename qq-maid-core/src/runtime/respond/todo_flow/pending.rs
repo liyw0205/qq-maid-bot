@@ -25,7 +25,8 @@ impl RustRespondService {
     /// 处理 Todo 待确认操作。
     ///
     /// 确认/取消优先于草稿修订；候选选择必须先选编号，再进入对应二次确认。
-    /// 删除继续调用 `TodoStore::cancel*`，保持软删除语义。
+    /// 普通删除继续调用 `TodoStore::cancel*` 保持软删除语义；
+    /// 已取消待办的清理会走带状态校验的物理删除路径。
     pub(in crate::runtime::respond) async fn handle_pending_todo_operation(
         &self,
         user_text: &str,
@@ -412,18 +413,18 @@ impl RustRespondService {
                         format_todo_done_confirm(item),
                         "todo_done",
                     )?)),
-                    PendingTodoAction::Delete => Ok(Some(self.replace_pending_response(
-                        session,
-                        user_text,
-                        PendingOperation::TodoDelete {
-                            initiator_user_id: initiator_user_id.clone(),
-                            owner_key: owner.key.clone(),
-                            item: item.clone(),
-                            created_at: now_iso_cn(),
-                        },
-                        format_todo_delete_confirm(item),
-                        "todo_delete",
-                    )?)),
+                    PendingTodoAction::Delete => {
+                        let (reply, command) = self.prepare_todo_delete_operation(
+                            session,
+                            owner,
+                            initiator_user_id.clone(),
+                            item,
+                            format_todo_inline(item),
+                        )?;
+                        Ok(Some(self.append_pending_response(
+                            session, user_text, reply, command,
+                        )?))
+                    }
                     PendingTodoAction::Edit => {
                         let edit_text = edit_text.unwrap_or_default();
                         match self.parse_todo_edit_draft(&edit_text, item).await? {
