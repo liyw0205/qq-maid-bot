@@ -1,0 +1,19 @@
+# deploy-remote.sh / sync_knowledge.sh 共用远程服务器配置
+# 复制为 deploy.conf 并填入实际值:
+#   cp scripts/deploy.conf.example scripts/deploy.conf
+#
+# deploy.conf 已在 .gitignore 中，不会被提交。
+
+# SSH 别名或 user@host
+REMOTE_HOST="your-server"
+
+# 远程项目根目录
+REMOTE_PROJECT_DIR="/root/project/qqbot"
+
+# 知识库同步映射 (sync_knowledge.sh 使用, deploy-remote.sh 忽略)
+# 格式: "本地目录|远程子目录"
+# 远程目标 = ${REMOTE_PROJECT_DIR}/runtime/config/knowledge/<子目录>/
+SYNC_MAP=(
+  # "/home/you/wiki/entries|wiki"
+  # "/home/you/docs/project|docs"
+)
