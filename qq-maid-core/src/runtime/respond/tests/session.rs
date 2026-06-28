@@ -412,6 +412,66 @@ async fn auto_title_delay_does_not_block_chat_response() {
 }
 
 #[tokio::test]
+async fn delayed_auto_title_preserves_messages_saved_after_snapshot() {
+    let provider =
+        MockProvider::with_title_replies(vec![Ok("后台标题"), Ok("后台标题"), Ok("后台标题")])
+            .with_title_delay(Duration::from_millis(250));
+    let (service, _) = test_service_with_title_provider(provider);
+
+    service.respond(message("第一条")).await.unwrap();
+    service.respond(message("第二条触发标题")).await.unwrap();
+    service.respond(message("第三条继续聊天")).await.unwrap();
+    service.respond(message("第四条继续聊天")).await.unwrap();
+
+    wait_for_session_title(&service, "后台标题").await;
+    sleep(Duration::from_millis(300)).await;
+    let session = service
+        .session_store
+        .get_or_create_active(&test_meta())
+        .unwrap();
+
+    assert_eq!(session.title, "后台标题");
+    assert_eq!(
+        session
+            .history
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "第一条",
+            "回复：第一条",
+            "第二条触发标题",
+            "回复：第二条触发标题",
+            "第三条继续聊天",
+            "回复：第三条继续聊天",
+            "第四条继续聊天",
+            "回复：第四条继续聊天",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn delayed_auto_title_does_not_overwrite_manual_rename() {
+    let provider = MockProvider::with_title_replies(vec![Ok("后台标题")])
+        .with_title_delay(Duration::from_millis(250));
+    let inspector = provider.clone();
+    let (service, _) = test_service_with_title_provider(provider);
+
+    service.respond(message("第一条")).await.unwrap();
+    service.respond(message("第二条触发标题")).await.unwrap();
+    wait_for_title_request_count(&inspector, 1).await;
+    service.respond(message("/rename 手工标题")).await.unwrap();
+
+    sleep(Duration::from_millis(350)).await;
+    let session = service
+        .session_store
+        .get_or_create_active(&test_meta())
+        .unwrap();
+
+    assert_eq!(session.title, "手工标题");
+}
+
+#[tokio::test]
 async fn auto_title_failure_does_not_fail_chat_response() {
     let provider = MockProvider::with_title_replies(vec![Err(LlmError::provider(
         "title blocked",

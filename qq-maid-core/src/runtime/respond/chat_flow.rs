@@ -298,8 +298,9 @@ impl RustRespondService {
     /// 如果会话标题还是默认值，且用户消息轮数在 2~4 之间，则后台尝试生成标题。
     ///
     /// 主聊天回复已经完成落库，标题只是展示增强；不能让标题模型的慢响应、
-    /// 失败或取消影响本轮 `Completed`。
-    fn schedule_auto_title(&self, mut session: SessionRecord) {
+    /// 失败或取消影响本轮 `Completed`。后台任务只允许条件更新标题，不能保存
+    /// 旧的完整会话快照，否则会覆盖期间继续写入的历史、pending 或手工重命名。
+    fn schedule_auto_title(&self, session: SessionRecord) {
         let Some(title_model) = self.title_model.clone() else {
             return;
         };
@@ -317,24 +318,36 @@ impl RustRespondService {
 
         let provider = self.provider.clone();
         let session_store = self.session_store.clone();
+        let session_id = session.session_id.clone();
+        let history = session.history.clone();
         tokio::spawn(async move {
-            match generate_session_title(provider.as_ref(), &title_model, &session.history, false)
-                .await
-            {
+            match generate_session_title(provider.as_ref(), &title_model, &history, false).await {
                 Ok(title) => {
-                    session.title = title;
-                    if let Err(err) = session_store.save(&mut session) {
-                        tracing::warn!(
-                            error = %err.message(),
-                            session_id = %session.session_id,
-                            "failed to save generated session title"
-                        );
+                    match session_store.update_title_if_current(
+                        &session_id,
+                        DEFAULT_SESSION_TITLE,
+                        &title,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::debug!(
+                                session_id = %session_id,
+                                "generated session title ignored because current title changed"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err.message(),
+                                session_id = %session_id,
+                                "failed to save generated session title"
+                            );
+                        }
                     }
                 }
                 Err(err) => {
                     tracing::debug!(
                         error = %err,
-                        session_id = %session.session_id,
+                        session_id = %session_id,
                         "session auto title generation failed"
                     );
                 }
@@ -369,7 +382,6 @@ pub(super) fn recent_session_messages(session: &SessionRecord, limit: usize) -> 
         .rev()
         .collect()
 }
-
 /// 根据用户输入更新会话状态（话题、场景、模式、焦点等）。
 fn update_session_state_from_user(session: &mut SessionRecord, user_text: &str) {
     let text = user_text.trim();
