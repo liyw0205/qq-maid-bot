@@ -287,11 +287,12 @@ commit message 使用简洁中文：
 注意：
 
 * tag 必须打在对应版本的 commit 上，不要漏打或打错版本号。
-* tag 必须打在 master 分支上。`release.yml` 的 `publish-release` job 会校验 tag 是否为 master 的祖先，不在 master 上则拒绝发布。
-  * 发版本前确保版本 commit 已合并到 master，再打 tag 推送。
+* tag 必须打在 master 分支上。`release.yml` 的 `preflight` job 会在矩阵构建前校验：
+  * tag commit 是否为 master 的祖先（`git merge-base --is-ancestor`），不在 master 上则立即失败，不启动 5 平台构建。
+  * tag commit 相对第一父提交是否包含有效代码变更（通过 `git diff` 检查变更文件），纯文档 tag 会跳过构建和发布。
+* 发版本前确保版本 commit 已合并到 master，再打 tag 推送。
 * 发版本前先跑完"常用验证"里的 CI 四步。
 * 不要把未发布的版本号写进 README 或文档里提前预告。
-* `release.yml` 的 `push: tags:` 也配置了 `paths-ignore`，纯文档变更打 tag 不会触发构建发布。发版本时因为一定会改 `Cargo.toml`（不在忽略列表），所以正常触发。
 
 ## 修改前后检查
 
