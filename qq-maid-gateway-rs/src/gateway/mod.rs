@@ -29,7 +29,7 @@ use self::{
     dedupe::MessageDedupe,
     event::{C2cMessage, GroupEventType, GroupMessage},
     group_filter::{GroupCooldowns, should_ignore_group_message, should_process_group_message},
-    logging::{c2c_message_log_summary, group_message_log_summary, mask_openid},
+    logging::{c2c_message_log_summary, group_message_log_summary, mask_identifier, mask_openid},
     outbound::{
         RuntimeRecordingGroupSender, RuntimeRecordingSender, record_qq_send_result,
         send_c2c_text_with_status, send_group_text_with_status,
@@ -612,6 +612,7 @@ where
     let user_openid = &message.user_openid;
     let masked_user = mask_openid(user_openid);
     let reply_msg_id = &message.message_id;
+    let masked_reply_msg_id = mask_identifier(reply_msg_id);
     let mut phase = C2cStreamingPhase::Pending(C2cStreamState {
         stream_id: None,
         index: 0,
@@ -658,7 +659,7 @@ where
                                 last_send_at = Instant::now();
                                 info!(
                                     user = %masked_user,
-                                    reply_msg_id,
+                                    reply_msg_id = %masked_reply_msg_id,
                                     phase = "first_chunk",
                                     stream_state = "active",
                                     state = 1_u8,
@@ -675,7 +676,7 @@ where
                             Ok(None) => {
                                 warn!(
                                     user = %masked_user,
-                                    reply_msg_id,
+                                    reply_msg_id = %masked_reply_msg_id,
                                     phase = "first_chunk",
                                     stream_state = "pending",
                                     state = 1_u8,
@@ -692,7 +693,7 @@ where
                             Err(err) => {
                                 warn!(
                                     user = %masked_user,
-                                    reply_msg_id,
+                                    reply_msg_id = %masked_reply_msg_id,
                                     phase = "first_chunk",
                                     stream_state = "pending",
                                     state = 1_u8,
@@ -732,7 +733,7 @@ where
                                     last_send_at = Instant::now();
                                     debug!(
                                         user = %masked_user,
-                                        reply_msg_id,
+                                        reply_msg_id = %masked_reply_msg_id,
                                         phase = "middle_chunk",
                                         stream_state = "active",
                                         state = 1_u8,
@@ -749,7 +750,7 @@ where
                                 Err(err) => {
                                     warn!(
                                         user = %masked_user,
-                                        reply_msg_id,
+                                        reply_msg_id = %masked_reply_msg_id,
                                         phase = "middle_chunk",
                                         stream_state = "broken_active",
                                         state = 1_u8,
@@ -799,7 +800,7 @@ where
                                     pending_delta.clear();
                                     info!(
                                         user = %masked_user,
-                                        reply_msg_id,
+                                        reply_msg_id = %masked_reply_msg_id,
                                         phase = "completed_flush",
                                         stream_state = "active",
                                         state = 1_u8,
@@ -815,7 +816,7 @@ where
                                 Err(err) => {
                                     warn!(
                                         user = %masked_user,
-                                        reply_msg_id,
+                                        reply_msg_id = %masked_reply_msg_id,
                                         phase = "completed_flush",
                                         stream_state = "broken_active",
                                         state = 1_u8,
@@ -840,7 +841,7 @@ where
                                     {
                                         Ok(()) => info!(
                                             user = %masked_user,
-                                            reply_msg_id,
+                                            reply_msg_id = %masked_reply_msg_id,
                                             phase = "completed_flush_final_chunk",
                                             stream_state = C2cStreamingPhase::Completed.name(),
                                             state = 10_u8,
@@ -854,7 +855,7 @@ where
                                         ),
                                         Err(end_err) => warn!(
                                             user = %masked_user,
-                                            reply_msg_id,
+                                            reply_msg_id = %masked_reply_msg_id,
                                             phase = "completed_flush_final_chunk",
                                             stream_state = "broken_active",
                                             state = 10_u8,
@@ -886,7 +887,7 @@ where
                             Ok(()) => {
                                 info!(
                                     user = %masked_user,
-                                    reply_msg_id,
+                                    reply_msg_id = %masked_reply_msg_id,
                                     phase = "final_chunk",
                                     stream_state = C2cStreamingPhase::Completed.name(),
                                     state = 10_u8,
@@ -902,7 +903,7 @@ where
                             Err(err) => {
                                 warn!(
                                     user = %masked_user,
-                                    reply_msg_id,
+                                    reply_msg_id = %masked_reply_msg_id,
                                     phase = "final_chunk",
                                     stream_state = "broken_active",
                                     state = 10_u8,
@@ -932,7 +933,7 @@ where
                         {
                             Ok(()) => info!(
                                 user = %masked_user,
-                                reply_msg_id,
+                                reply_msg_id = %masked_reply_msg_id,
                                 phase = "broken_active_final_chunk",
                                 stream_state = C2cStreamingPhase::Completed.name(),
                                 state = 10_u8,
@@ -946,7 +947,7 @@ where
                             ),
                             Err(err) => warn!(
                                 user = %masked_user,
-                                reply_msg_id,
+                                reply_msg_id = %masked_reply_msg_id,
                                 phase = "broken_active_final_chunk",
                                 stream_state = "broken_active",
                                 state = 10_u8,
@@ -968,7 +969,7 @@ where
                             .inspect(|_| {
                                 info!(
                                     user = %masked_user,
-                                    reply_msg_id,
+                                    reply_msg_id = %masked_reply_msg_id,
                                     phase = "ordinary_fallback_on_completed",
                                     stream_state = stream_state_name,
                                     final_chars,
@@ -978,7 +979,7 @@ where
                             .inspect_err(|fallback_err| {
                                 warn!(
                                     user = %masked_user,
-                                    reply_msg_id,
+                                    reply_msg_id = %masked_reply_msg_id,
                                     phase = "ordinary_fallback_on_completed",
                                     stream_state = stream_state_name,
                                     error = %fallback_err,
@@ -993,7 +994,7 @@ where
             RespondEvent::Failed(failure) => {
                 warn!(
                     user = %masked_user,
-                    reply_msg_id,
+                    reply_msg_id = %masked_reply_msg_id,
                     kind = ?failure.kind,
                     retryable = failure.retryable,
                     stream_state = phase.name(),
@@ -1015,7 +1016,7 @@ where
                     .inspect_err(|err| {
                         warn!(
                             user = %masked_user,
-                            reply_msg_id,
+                            reply_msg_id = %masked_reply_msg_id,
                             phase = "failed_final_chunk",
                             state = 10_u8,
                             reset = false,
@@ -1040,7 +1041,7 @@ where
     let accumulated_chars = accumulated.chars().count();
     warn!(
         user = %masked_user,
-        reply_msg_id,
+        reply_msg_id = %masked_reply_msg_id,
         stream_state = phase.name(),
         accumulated_chars,
         "core respond stream closed before Completed"
@@ -1116,8 +1117,9 @@ async fn send_stream_chunk<S: C2cStreamSender + ?Sized>(
 
 /// 发送流式结束帧（state=10）。
 ///
-/// Completed 使用完整 Markdown + reset=true 校正最终气泡；异常收尾仍可传空内容只结束流，
-/// 但不会回退成第二条普通消息，保持流式气泡的唯一发送所有权。
+/// Completed 使用完整 Markdown + reset=true 校正最终气泡；异常收尾仍可传空内容只结束流。
+/// 终包是关闭动作，不再提交新的 next_index；否则后续日志会把终包误当成内容分片。
+/// 首帧成功后不会回退成第二条普通消息，保持流式气泡的唯一发送所有权。
 async fn send_stream_end<S: C2cStreamSender + ?Sized>(
     sender: &S,
     user_openid: &str,
@@ -1136,7 +1138,6 @@ async fn send_stream_end<S: C2cStreamSender + ?Sized>(
         // 正常收尾前已经有首帧 id；这里只兼容“直接最终帧”或异常状态下的空 id。
         stream_state.stream_id = Some(id.to_owned());
     }
-    stream_state.index += 1;
     Ok(())
 }
 
@@ -1639,6 +1640,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_single_content_packet_then_final_uses_continuous_index() {
+        let events = FakeEventStream::new([
+            RespondEvent::TextDelta("测试成功".to_owned()),
+            RespondEvent::Completed(respond_response("测试成功")),
+        ]);
+        let sender = FakeStreamSender::new([Ok(Some("stream-1".to_owned())), Ok(None)]);
+
+        stream_respond_c2c_with_sender(events, &sender, &c2c_message(), &test_config())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sender.calls(),
+            vec![
+                FakeCall::Stream {
+                    content: "测试成功".to_owned(),
+                    msg_id: Some("msg-1".to_owned()),
+                    stream_id: None,
+                    index: 0,
+                    state: 1,
+                    reset: false,
+                },
+                FakeCall::Stream {
+                    content: "测试成功".to_owned(),
+                    msg_id: Some("msg-1".to_owned()),
+                    stream_id: Some("stream-1".to_owned()),
+                    index: 1,
+                    state: 10,
+                    reset: true,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn stream_active_path_reuses_id_and_increments_index() {
         let events = FakeEventStream::with_delays([
             (Duration::ZERO, RespondEvent::TextDelta("晚上".to_owned())),
@@ -1681,6 +1717,42 @@ mod tests {
                     msg_id: Some("msg-1".to_owned()),
                     stream_id: Some("stream-1".to_owned()),
                     index: 2,
+                    state: 10,
+                    reset: true,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_empty_delta_does_not_consume_index() {
+        let events = FakeEventStream::new([
+            RespondEvent::TextDelta(String::new()),
+            RespondEvent::TextDelta("好".to_owned()),
+            RespondEvent::Completed(respond_response("好")),
+        ]);
+        let sender = FakeStreamSender::new([Ok(Some("stream-1".to_owned())), Ok(None)]);
+
+        stream_respond_c2c_with_sender(events, &sender, &c2c_message(), &test_config())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sender.calls(),
+            vec![
+                FakeCall::Stream {
+                    content: "好".to_owned(),
+                    msg_id: Some("msg-1".to_owned()),
+                    stream_id: None,
+                    index: 0,
+                    state: 1,
+                    reset: false,
+                },
+                FakeCall::Stream {
+                    content: "好".to_owned(),
+                    msg_id: Some("msg-1".to_owned()),
+                    stream_id: Some("stream-1".to_owned()),
+                    index: 1,
                     state: 10,
                     reset: true,
                 },
@@ -1889,6 +1961,94 @@ mod tests {
             vec![FakeCall::Markdown {
                 content: "晚上好".to_owned(),
                 msg_id: Some("msg-1".to_owned()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_completed_sends_single_final_chunk() {
+        let events = FakeEventStream::new([
+            RespondEvent::TextDelta("好".to_owned()),
+            RespondEvent::Completed(respond_response("好")),
+            RespondEvent::Completed(respond_response("好")),
+        ]);
+        let sender = FakeStreamSender::new([Ok(Some("stream-1".to_owned())), Ok(None)]);
+
+        stream_respond_c2c_with_sender(events, &sender, &c2c_message(), &test_config())
+            .await
+            .unwrap();
+
+        let final_count = sender
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, FakeCall::Stream { state: 10, .. }))
+            .count();
+        assert_eq!(final_count, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_chunk_failure_does_not_advance_next_index() {
+        let sender = FakeStreamSender::new([Err(ApiError::Unsupported("stream"))]);
+        let mut stream_state = C2cStreamState {
+            stream_id: Some("stream-1".to_owned()),
+            index: 1,
+        };
+
+        let result = send_stream_chunk(
+            &sender,
+            "user-1",
+            Some("msg-1"),
+            "失败分片",
+            &mut stream_state,
+            1,
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(stream_state.index, 1);
+        assert_eq!(
+            sender.calls(),
+            vec![FakeCall::Stream {
+                content: "失败分片".to_owned(),
+                msg_id: Some("msg-1".to_owned()),
+                stream_id: Some("stream-1".to_owned()),
+                index: 1,
+                state: 1,
+                reset: false,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_final_success_does_not_commit_extra_next_index() {
+        let sender = FakeStreamSender::new([Ok(None)]);
+        let mut stream_state = C2cStreamState {
+            stream_id: Some("stream-1".to_owned()),
+            index: 2,
+        };
+
+        send_stream_end(
+            &sender,
+            "user-1",
+            Some("msg-1"),
+            "最终正文",
+            &mut stream_state,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stream_state.index, 2);
+        assert_eq!(
+            sender.calls(),
+            vec![FakeCall::Stream {
+                content: "最终正文".to_owned(),
+                msg_id: Some("msg-1".to_owned()),
+                stream_id: Some("stream-1".to_owned()),
+                index: 2,
+                state: 10,
+                reset: true,
             }]
         );
     }

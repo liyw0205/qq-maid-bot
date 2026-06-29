@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use crate::{
     auth::{AccessTokenManager, AuthError},
-    logging::{mask_openid, reqwest_error_summary},
+    logging::{mask_identifier, mask_openid, reqwest_error_summary},
     markdown::{MarkdownPayload, build_c2c_markdown_payload, build_group_markdown_payload},
     media::{ImagePayload, build_c2c_image_payload},
     render::OutboundMessage,
@@ -155,8 +155,8 @@ pub type StreamSendResult = Result<Option<String>, ApiError>;
 
 /// C2C 流式发送状态管理。
 ///
-/// 在一次流式会话中维护首帧 stream_id 和分片 index，确保每次发送到 QQ
-/// 的 stream 参数正确。
+/// 在一次流式会话中维护首帧 stream_id 和下一次内容分片要使用的 index。
+/// index 只在 QQ 明确接受非终包后推进；终包属于关闭动作，不再生成新的 next_index。
 #[derive(Debug)]
 pub(crate) struct C2cStreamState {
     pub(crate) stream_id: Option<String>,
@@ -297,6 +297,8 @@ impl QqApiClient {
     ) -> StreamSendResult {
         let url = format!("{}/v2/users/{user_openid}/messages", self.api_base);
         let masked_user = mask_openid(user_openid);
+        let masked_message_id = msg_id.map(mask_identifier).unwrap_or_default();
+        let request_fields = stream_request_log_fields(state, stream_state, false);
         let response = self
             .client
             .post(url)
@@ -307,13 +309,19 @@ impl QqApiClient {
             .map_err(|error| {
                 warn!(
                     user = %masked_user,
-                    source_message_id = msg_id.unwrap_or(""),
+                    source_message_id = %masked_message_id,
                     phase = %stream_log_phase(state, stream_state.index),
                     state,
                     index = stream_state.index,
                     reset,
+                    previous_success_index = ?request_fields.previous_success_index,
+                    next_index = request_fields.next_index,
                     has_stream_id = stream_state.stream_id.is_some(),
                     content_chars = stream_payload_content_chars(payload),
+                    http_status = "",
+                    qq_code = "",
+                    qq_message = "",
+                    index_committed = request_fields.index_committed,
                     error = %reqwest_error_summary(&error),
                     "QQ stream send request failed"
                 );
@@ -324,18 +332,22 @@ impl QqApiClient {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             let (qq_code, qq_message) = qq_api_error_fields(&body);
+            let failed_fields = stream_request_log_fields(state, stream_state, false);
             warn!(
                 user = %masked_user,
-                source_message_id = msg_id.unwrap_or(""),
+                source_message_id = %masked_message_id,
                 phase = %stream_log_phase(state, stream_state.index),
                 state,
                 index = stream_state.index,
                 reset,
+                previous_success_index = ?failed_fields.previous_success_index,
+                next_index = failed_fields.next_index,
                 has_stream_id = stream_state.stream_id.is_some(),
                 content_chars = stream_payload_content_chars(payload),
                 http_status = %status,
                 qq_code = qq_code.as_deref().unwrap_or(""),
                 qq_message = qq_message.as_deref().unwrap_or(""),
+                index_committed = failed_fields.index_committed,
                 error_summary = %qq_api_error_body_summary(&body),
                 "QQ stream send returned non-success status"
             );
@@ -345,19 +357,24 @@ impl QqApiClient {
         let body = response.text().await.map_err(ApiError::Http)?;
         let sent_stream_id = extract_c2c_text_stream_id(&body);
         let (qq_code, qq_message) = qq_api_error_fields(&body);
+        let success_fields = stream_request_log_fields(state, stream_state, true);
         info!(
             user = %masked_user,
-            source_message_id = msg_id.unwrap_or(""),
+            source_message_id = %masked_message_id,
             phase = %stream_log_phase(state, stream_state.index),
             state,
             index = stream_state.index,
             reset,
+            previous_success_index = ?success_fields.previous_success_index,
+            next_index = success_fields.next_index,
             has_stream_id = stream_state.stream_id.is_some(),
             content_chars = stream_payload_content_chars(payload),
             http_status = %status,
             qq_code = qq_code.as_deref().unwrap_or(""),
             qq_message = qq_message.as_deref().unwrap_or(""),
-            returned_stream_id = sent_stream_id.as_deref().unwrap_or(""),
+            index_committed = success_fields.index_committed,
+            returned_stream_id = %sent_stream_id.as_deref().map(mask_identifier).unwrap_or_default(),
+            returned_stream_id_present = sent_stream_id.is_some(),
             "qq stream send success"
         );
         Ok(sent_stream_id)
@@ -579,6 +596,31 @@ fn stream_payload_content_chars(payload: &Value) -> usize {
         .and_then(Value::as_str)
         .map(|content| content.chars().count())
         .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamRequestLogFields {
+    previous_success_index: Option<u32>,
+    next_index: u32,
+    index_committed: bool,
+}
+
+fn stream_request_log_fields(
+    state: u8,
+    stream_state: &C2cStreamState,
+    request_succeeded: bool,
+) -> StreamRequestLogFields {
+    // `stream_state.index` 表示本次请求使用的 index；只有非终包成功后才推进下一次 index。
+    let index_committed = request_succeeded && state != 10;
+    StreamRequestLogFields {
+        previous_success_index: stream_state.index.checked_sub(1),
+        next_index: if index_committed {
+            stream_state.index.saturating_add(1)
+        } else {
+            stream_state.index
+        },
+        index_committed,
+    }
 }
 
 pub(crate) fn extract_sent_message_id(body: &str) -> Option<String> {
@@ -826,6 +868,49 @@ mod tests {
             None
         );
         assert_eq!(extract_c2c_text_stream_id(r#"{"msg_id":"msg-1"}"#), None);
+    }
+
+    #[test]
+    fn stream_request_log_fields_report_index_commit_semantics() {
+        let first_state = C2cStreamState {
+            stream_id: None,
+            index: 0,
+        };
+        assert_eq!(
+            stream_request_log_fields(1, &first_state, true),
+            StreamRequestLogFields {
+                previous_success_index: None,
+                next_index: 1,
+                index_committed: true,
+            }
+        );
+
+        let middle_state = C2cStreamState {
+            stream_id: Some("stream-1".to_owned()),
+            index: 1,
+        };
+        assert_eq!(
+            stream_request_log_fields(1, &middle_state, false),
+            StreamRequestLogFields {
+                previous_success_index: Some(0),
+                next_index: 1,
+                index_committed: false,
+            }
+        );
+
+        // 终包只关闭已存在的流式气泡，不再提交新的 next_index。
+        let final_state = C2cStreamState {
+            stream_id: Some("stream-1".to_owned()),
+            index: 2,
+        };
+        assert_eq!(
+            stream_request_log_fields(10, &final_state, true),
+            StreamRequestLogFields {
+                previous_success_index: Some(1),
+                next_index: 2,
+                index_committed: false,
+            }
+        );
     }
 
     #[derive(Debug, Default)]
