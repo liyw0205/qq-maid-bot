@@ -106,7 +106,8 @@ pub type SendFuture<'a> = Pin<Box<dyn Future<Output = SendResult> + Send + 'a>>;
 /// QQ C2C Markdown 流式消息载荷。
 ///
 /// 内容分片只发送 `msg_type=2` 和 `markdown.content`，禁止同时携带顶层 `content`，
-/// 避免 QQ 端把同一帧解释为普通文本流。结束包保留空 markdown，满足 QQ 必填校验但不重复正文。
+/// 避免 QQ 端把同一帧解释为普通文本流。真实环境要求结束包的 Markdown 非空，
+/// 因此结束包仍携带完整最终正文，但不携带 index/reset。
 #[derive(Debug, Serialize)]
 struct C2cMarkdownStreamPayload<'a> {
     msg_type: u8,
@@ -161,10 +162,86 @@ pub type StreamSendResult = Result<Option<String>, ApiError>;
 ///
 /// 在一次流式会话中维护首帧 stream_id 和下一次内容分片要使用的 index。
 /// index 只在 QQ 明确接受非终包后推进；终包属于关闭动作，不再生成新的 next_index。
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct C2cStreamState {
     pub(crate) stream_id: Option<String>,
     pub(crate) index: u32,
+    msg_seq: C2cStreamMsgSeqState,
+}
+
+impl C2cStreamState {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn begin_msg_seq_attempt(
+        &mut self,
+        stream_state_value: u8,
+        next_msg_seq: impl FnOnce() -> u32,
+    ) -> C2cStreamMsgSeqAttempt {
+        let key = C2cStreamMsgSeqKey {
+            state: stream_state_value,
+            // final 包已确认不携带 stream.index；这里的 key 必须和 payload 形状一致，
+            // 否则 final 可能误复用上一条内容分片的外层 msg_seq。
+            stream_index: (stream_state_value != 10).then_some(self.index),
+        };
+        if let Some(pending) = self.msg_seq.pending.filter(|pending| pending.key == key) {
+            return C2cStreamMsgSeqAttempt {
+                key,
+                msg_seq: pending.msg_seq,
+                previous_success_msg_seq: pending.previous_success_msg_seq,
+            };
+        }
+
+        let attempt = C2cStreamMsgSeqAttempt {
+            key,
+            msg_seq: next_msg_seq(),
+            previous_success_msg_seq: self.msg_seq.previous_success_msg_seq,
+        };
+        self.msg_seq.pending = Some(C2cStreamPendingMsgSeq {
+            key,
+            msg_seq: attempt.msg_seq,
+            previous_success_msg_seq: attempt.previous_success_msg_seq,
+        });
+        attempt
+    }
+
+    fn commit_msg_seq_attempt(&mut self, attempt: C2cStreamMsgSeqAttempt) {
+        self.msg_seq.previous_success_msg_seq = Some(attempt.msg_seq);
+        if self
+            .msg_seq
+            .pending
+            .is_some_and(|pending| pending.key == attempt.key && pending.msg_seq == attempt.msg_seq)
+        {
+            self.msg_seq.pending = None;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct C2cStreamMsgSeqState {
+    previous_success_msg_seq: Option<u32>,
+    pending: Option<C2cStreamPendingMsgSeq>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct C2cStreamMsgSeqKey {
+    state: u8,
+    stream_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct C2cStreamPendingMsgSeq {
+    key: C2cStreamMsgSeqKey,
+    msg_seq: u32,
+    previous_success_msg_seq: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct C2cStreamMsgSeqAttempt {
+    key: C2cStreamMsgSeqKey,
+    msg_seq: u32,
+    previous_success_msg_seq: Option<u32>,
 }
 
 pub trait OutboundSender: Send + Sync {
@@ -273,14 +350,16 @@ impl QqApiClient {
         user_openid: &str,
         msg_id: Option<&str>,
         markdown: &MarkdownPayload,
-        stream_state: &C2cStreamState,
+        stream_state: &mut C2cStreamState,
         stream_state_value: u8,
         reset: Option<bool>,
     ) -> StreamSendResult {
+        let msg_seq_attempt =
+            stream_state.begin_msg_seq_attempt(stream_state_value, || self.next_msg_seq());
         let payload = build_c2c_markdown_stream_payload(
             markdown,
             msg_id,
-            self.next_msg_seq(),
+            msg_seq_attempt.msg_seq,
             stream_state,
             stream_state_value,
             reset,
@@ -290,6 +369,7 @@ impl QqApiClient {
             msg_id,
             stream_state_value,
             stream_state,
+            msg_seq_attempt,
             &payload,
         )
         .await
@@ -301,7 +381,8 @@ impl QqApiClient {
         user_openid: &str,
         msg_id: Option<&str>,
         stream_state_value: u8,
-        stream_state: &C2cStreamState,
+        stream_state: &mut C2cStreamState,
+        msg_seq_attempt: C2cStreamMsgSeqAttempt,
         payload: &Value,
     ) -> StreamSendResult {
         let url = format!("{}/v2/users/{user_openid}/messages", self.api_base);
@@ -311,7 +392,8 @@ impl QqApiClient {
         let reset = stream_reset_log_value(payload);
         let index_present = stream_payload_index(payload).is_some();
         let reset_present = reset.is_some();
-        let request_fields = stream_request_log_fields(stream_state_value, stream_state, false);
+        let request_fields =
+            stream_request_log_fields(stream_state_value, stream_state, msg_seq_attempt, false);
         let response = self
             .client
             .post(url)
@@ -324,6 +406,9 @@ impl QqApiClient {
                     user = %masked_user,
                     source_message_id = %masked_message_id,
                     phase = %stream_log_phase(stream_state_value, stream_state.index),
+                    msg_seq = request_fields.msg_seq,
+                    previous_success_msg_seq = ?request_fields.previous_success_msg_seq,
+                    state = stream_state_value,
                     stream_state_value,
                     done,
                     index_present,
@@ -338,6 +423,7 @@ impl QqApiClient {
                     qq_code = "",
                     qq_message = "",
                     index_committed = request_fields.index_committed,
+                    msg_seq_committed = request_fields.msg_seq_committed,
                     error = %reqwest_error_summary(&error),
                     "QQ stream send request failed"
                 );
@@ -348,11 +434,15 @@ impl QqApiClient {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             let (qq_code, qq_message) = qq_api_error_fields(&body);
-            let failed_fields = stream_request_log_fields(stream_state_value, stream_state, false);
+            let failed_fields =
+                stream_request_log_fields(stream_state_value, stream_state, msg_seq_attempt, false);
             warn!(
                 user = %masked_user,
                 source_message_id = %masked_message_id,
                 phase = %stream_log_phase(stream_state_value, stream_state.index),
+                msg_seq = failed_fields.msg_seq,
+                previous_success_msg_seq = ?failed_fields.previous_success_msg_seq,
+                state = stream_state_value,
                 stream_state_value,
                 done,
                 index_present,
@@ -367,20 +457,26 @@ impl QqApiClient {
                 qq_code = qq_code.as_deref().unwrap_or(""),
                 qq_message = qq_message.as_deref().unwrap_or(""),
                 index_committed = failed_fields.index_committed,
+                msg_seq_committed = failed_fields.msg_seq_committed,
                 error_summary = %qq_api_error_body_summary(&body),
                 "QQ stream send returned non-success status"
             );
             return Err(ApiError::Status { status, body });
         }
 
+        stream_state.commit_msg_seq_attempt(msg_seq_attempt);
         let body = response.text().await.map_err(ApiError::Http)?;
         let sent_stream_id = extract_c2c_text_stream_id(&body);
         let (qq_code, qq_message) = qq_api_error_fields(&body);
-        let success_fields = stream_request_log_fields(stream_state_value, stream_state, true);
+        let success_fields =
+            stream_request_log_fields(stream_state_value, stream_state, msg_seq_attempt, true);
         info!(
             user = %masked_user,
             source_message_id = %masked_message_id,
             phase = %stream_log_phase(stream_state_value, stream_state.index),
+            msg_seq = success_fields.msg_seq,
+            previous_success_msg_seq = ?success_fields.previous_success_msg_seq,
+            state = stream_state_value,
             stream_state_value,
             done,
             index_present,
@@ -395,6 +491,7 @@ impl QqApiClient {
             qq_code = qq_code.as_deref().unwrap_or(""),
             qq_message = qq_message.as_deref().unwrap_or(""),
             index_committed = success_fields.index_committed,
+            msg_seq_committed = success_fields.msg_seq_committed,
             returned_stream_id = %sent_stream_id.as_deref().map(mask_identifier).unwrap_or_default(),
             returned_stream_id_present = sent_stream_id.is_some(),
             "qq stream send success"
@@ -641,12 +738,16 @@ fn stream_payload_index(payload: &Value) -> Option<u64> {
 struct StreamRequestLogFields {
     previous_success_index: Option<u32>,
     next_index: u32,
+    msg_seq: u32,
+    previous_success_msg_seq: Option<u32>,
     index_committed: bool,
+    msg_seq_committed: bool,
 }
 
 fn stream_request_log_fields(
     stream_state_value: u8,
     stream_state: &C2cStreamState,
+    msg_seq_attempt: C2cStreamMsgSeqAttempt,
     request_succeeded: bool,
 ) -> StreamRequestLogFields {
     // `stream_state.index` 表示下一次内容分片要使用的 index；只有非终包成功后才推进。
@@ -658,7 +759,10 @@ fn stream_request_log_fields(
         } else {
             stream_state.index
         },
+        msg_seq: msg_seq_attempt.msg_seq,
+        previous_success_msg_seq: msg_seq_attempt.previous_success_msg_seq,
         index_committed,
+        msg_seq_committed: request_succeeded,
     }
 }
 
@@ -839,6 +943,7 @@ mod tests {
             &C2cStreamState {
                 stream_id: None,
                 index: 0,
+                ..C2cStreamState::new()
             },
             1,
             Some(false),
@@ -863,6 +968,7 @@ mod tests {
             &C2cStreamState {
                 stream_id: Some("stream-1".to_owned()),
                 index: 1,
+                ..C2cStreamState::new()
             },
             1,
             Some(false),
@@ -891,6 +997,7 @@ mod tests {
             &C2cStreamState {
                 stream_id: Some("stream-1".to_owned()),
                 index: 2,
+                ..C2cStreamState::new()
             },
             10,
             None,
@@ -913,6 +1020,7 @@ mod tests {
         assert!(!final_json.contains("\"reset\""));
         assert!(final_json.contains("\"markdown\":{"));
         assert!(final_json.contains("\"content\":\"**hello** delta\""));
+        assert_ne!(middle_payload["msg_seq"], final_payload["msg_seq"]);
     }
 
     #[test]
@@ -933,26 +1041,50 @@ mod tests {
         let first_state = C2cStreamState {
             stream_id: None,
             index: 0,
+            ..C2cStreamState::new()
+        };
+        let first_attempt = C2cStreamMsgSeqAttempt {
+            key: C2cStreamMsgSeqKey {
+                state: 1,
+                stream_index: Some(0),
+            },
+            msg_seq: 11,
+            previous_success_msg_seq: None,
         };
         assert_eq!(
-            stream_request_log_fields(1, &first_state, true),
+            stream_request_log_fields(1, &first_state, first_attempt, true),
             StreamRequestLogFields {
                 previous_success_index: None,
                 next_index: 1,
+                msg_seq: 11,
+                previous_success_msg_seq: None,
                 index_committed: true,
+                msg_seq_committed: true,
             }
         );
 
         let middle_state = C2cStreamState {
             stream_id: Some("stream-1".to_owned()),
             index: 1,
+            ..C2cStreamState::new()
+        };
+        let middle_attempt = C2cStreamMsgSeqAttempt {
+            key: C2cStreamMsgSeqKey {
+                state: 1,
+                stream_index: Some(1),
+            },
+            msg_seq: 12,
+            previous_success_msg_seq: Some(11),
         };
         assert_eq!(
-            stream_request_log_fields(1, &middle_state, false),
+            stream_request_log_fields(1, &middle_state, middle_attempt, false),
             StreamRequestLogFields {
                 previous_success_index: Some(0),
                 next_index: 1,
+                msg_seq: 12,
+                previous_success_msg_seq: Some(11),
                 index_committed: false,
+                msg_seq_committed: false,
             }
         );
 
@@ -960,15 +1092,81 @@ mod tests {
         let final_state = C2cStreamState {
             stream_id: Some("stream-1".to_owned()),
             index: 2,
+            ..C2cStreamState::new()
+        };
+        let final_attempt = C2cStreamMsgSeqAttempt {
+            key: C2cStreamMsgSeqKey {
+                state: 10,
+                stream_index: None,
+            },
+            msg_seq: 13,
+            previous_success_msg_seq: Some(12),
         };
         assert_eq!(
-            stream_request_log_fields(10, &final_state, true),
+            stream_request_log_fields(10, &final_state, final_attempt, true),
             StreamRequestLogFields {
                 previous_success_index: Some(1),
                 next_index: 2,
+                msg_seq: 13,
+                previous_success_msg_seq: Some(12),
                 index_committed: false,
+                msg_seq_committed: true,
             }
         );
+    }
+
+    #[test]
+    fn stream_msg_seq_reuses_same_value_for_same_failed_request_retry() {
+        let mut state = C2cStreamState {
+            stream_id: Some("stream-1".to_owned()),
+            index: 1,
+            ..C2cStreamState::new()
+        };
+        let mut next = 40;
+
+        let first = state.begin_msg_seq_attempt(1, || {
+            next += 1;
+            next
+        });
+        let retry = state.begin_msg_seq_attempt(1, || {
+            next += 1;
+            next
+        });
+
+        assert_eq!(first.msg_seq, 41);
+        assert_eq!(retry.msg_seq, 41);
+        assert_eq!(next, 41);
+        assert_eq!(retry.previous_success_msg_seq, None);
+    }
+
+    #[test]
+    fn stream_final_msg_seq_does_not_reuse_previous_success_or_failed_middle() {
+        let mut state = C2cStreamState {
+            stream_id: Some("stream-1".to_owned()),
+            index: 1,
+            ..C2cStreamState::new()
+        };
+        let mut next = 50;
+
+        let middle = state.begin_msg_seq_attempt(1, || {
+            next += 1;
+            next
+        });
+        state.commit_msg_seq_attempt(middle);
+        state.index = 2;
+        let failed_middle_retry_key = state.begin_msg_seq_attempt(1, || {
+            next += 1;
+            next
+        });
+        let final_attempt = state.begin_msg_seq_attempt(10, || {
+            next += 1;
+            next
+        });
+
+        assert_ne!(middle.msg_seq, final_attempt.msg_seq);
+        assert_ne!(failed_middle_retry_key.msg_seq, final_attempt.msg_seq);
+        assert_eq!(final_attempt.previous_success_msg_seq, Some(middle.msg_seq));
+        assert!(final_attempt.key.stream_index.is_none());
     }
 
     #[derive(Debug, Default)]
