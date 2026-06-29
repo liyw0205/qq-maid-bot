@@ -24,7 +24,7 @@ qq-maid-core RSS scheduler
 - `/ping` 会在 gateway 本地返回诊断信息，直接读取 Core 进程内健康快照；`/ping check` 会调用 `CoreService::upstream_check()` 执行一次不写会话的最小上游检查。
 - 文本回复使用 QQ C2C `msg_type: 0`、原消息 `msg_id` 和递增 `msg_seq`。
 - 入站附件不会改 Core 稳定请求模型；图片等附件信息会追加到文本末尾，例如 `[附件 image/jpeg: a.jpg https://example.test/a.jpg]`。
-- Markdown 和图片保留独立 outbound 类型、payload 构造和发送入口；发送失败会 warn 并 fallback 到文本。第一版真机验收不以富媒体成功发送为前置条件。
+- Markdown 和图片保留独立 outbound 类型、payload 构造和发送入口；发送失败会 warn 并 fallback 到文本。C2C 流式回复当前固定使用 Markdown 流式载荷，首帧成功后不再补发普通全文。
 - Core RSS 调度和 Todo 每日提醒通过进程内 `PushSink` 主动推送，不再暴露本机 HTTP push 入口。
 - 不做频道、频道私信、Ark、Embed、Keyboard、多租户或旧接入层兼容。
 

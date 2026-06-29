@@ -465,11 +465,11 @@ impl RespondEventStream for qq_maid_core::service::CoreResponseStream {
 
 /// C2C 流式发送抽象；普通消息能力复用 `OutboundSender`，确保 Pending fallback 走同一发送链路。
 trait C2cStreamSender: OutboundSender {
-    fn send_stream_text<'a>(
+    fn send_stream_markdown<'a>(
         &'a self,
         user_openid: &'a str,
         msg_id: Option<&'a str>,
-        content: &'a str,
+        markdown: &'a MarkdownPayload,
         stream_state: &'a C2cStreamState,
         state: u8,
         reset: bool,
@@ -477,11 +477,11 @@ trait C2cStreamSender: OutboundSender {
 }
 
 impl C2cStreamSender for RuntimeRecordingSender<'_> {
-    fn send_stream_text<'a>(
+    fn send_stream_markdown<'a>(
         &'a self,
         user_openid: &'a str,
         msg_id: Option<&'a str>,
-        content: &'a str,
+        markdown: &'a MarkdownPayload,
         stream_state: &'a C2cStreamState,
         state: u8,
         reset: bool,
@@ -489,7 +489,7 @@ impl C2cStreamSender for RuntimeRecordingSender<'_> {
         Box::pin(async move {
             let result = self
                 .inner
-                .send_c2c_text_stream(user_openid, msg_id, content, stream_state, state, reset)
+                .send_c2c_markdown_stream(user_openid, msg_id, markdown, stream_state, state, reset)
                 .await;
             record_qq_send_result(self.runtime, &result);
             result
@@ -617,8 +617,8 @@ where
         index: 0,
     });
     let mut accumulated = String::new();
-    // QQ stream 的 reset=false 是“续接本次 content”，不能反复提交全文；
-    // 因此单独维护待发送增量，结束帧先按参考图使用空 content + reset=false 验证。
+    // QQ stream 的 reset=false 是“续接本次 Markdown content”，不能反复提交全文；
+    // 因此中间帧单独维护待发送增量，Completed 最终帧再用 reset=true 发送完整 Markdown 校正。
     let mut pending_delta = String::new();
     let mut last_send_at = Instant::now();
     let mut stream_first_attempted = false;
@@ -775,8 +775,8 @@ where
                 }
             }
             RespondEvent::Completed(response) => {
-                let final_chars = completed_response_chars(&response)
-                    .unwrap_or_else(|| accumulated.chars().count());
+                let final_content = completed_response_content(&response).unwrap_or(&accumulated);
+                let final_chars = final_content.chars().count();
                 match phase {
                     C2cStreamingPhase::Active(mut stream_state) => {
                         // Active 表示 QQ 已创建流式气泡，Completed 只能继续使用同一个 stream id。
@@ -832,7 +832,9 @@ where
                                         sender,
                                         user_openid,
                                         Some(reply_msg_id),
+                                        final_content,
                                         &mut stream_state,
+                                        true,
                                     )
                                     .await
                                     {
@@ -842,11 +844,11 @@ where
                                             phase = "completed_flush_final_chunk",
                                             stream_state = C2cStreamingPhase::Completed.name(),
                                             state = 10_u8,
-                                            reset = false,
+                                            reset = true,
                                             index = end_index,
                                             has_stream_id_before_send = stream_state.stream_id.is_some(),
                                             has_stream_id_after_send = stream_state.stream_id.is_some(),
-                                            content_chars = 0_usize,
+                                            content_chars = final_chars,
                                             final_chars,
                                             "QQ stream end after pending delta flush failure succeeded"
                                         ),
@@ -856,10 +858,10 @@ where
                                             phase = "completed_flush_final_chunk",
                                             stream_state = "broken_active",
                                             state = 10_u8,
-                                            reset = false,
+                                            reset = true,
                                             index = end_index,
                                             has_stream_id_before_send = stream_state.stream_id.is_some(),
-                                            content_chars = 0_usize,
+                                            content_chars = final_chars,
                                             error = %end_err.log_summary(),
                                             final_chars,
                                             "QQ stream end after pending delta flush failure failed"
@@ -875,7 +877,9 @@ where
                             sender,
                             user_openid,
                             Some(reply_msg_id),
+                            final_content,
                             &mut stream_state,
+                            true,
                         )
                         .await
                         {
@@ -886,11 +890,11 @@ where
                                     phase = "final_chunk",
                                     stream_state = C2cStreamingPhase::Completed.name(),
                                     state = 10_u8,
-                                    reset = false,
+                                    reset = true,
                                     index = final_index,
                                     has_stream_id_before_send = had_stream_id,
                                     has_stream_id_after_send = stream_state.stream_id.is_some(),
-                                    content_chars = 0_usize,
+                                    content_chars = final_chars,
                                     final_chars,
                                     "QQ stream final send succeeded"
                                 );
@@ -902,10 +906,10 @@ where
                                     phase = "final_chunk",
                                     stream_state = "broken_active",
                                     state = 10_u8,
-                                    reset = false,
+                                    reset = true,
                                     index = final_index,
                                     has_stream_id_before_send = had_stream_id,
-                                    content_chars = 0_usize,
+                                    content_chars = final_chars,
                                     error = %err.log_summary(),
                                     final_chars,
                                     "QQ stream final send failed; ordinary fallback is disabled after stream id was created"
@@ -920,7 +924,9 @@ where
                             sender,
                             user_openid,
                             Some(reply_msg_id),
+                            final_content,
                             &mut stream_state,
+                            true,
                         )
                         .await
                         {
@@ -930,11 +936,11 @@ where
                                 phase = "broken_active_final_chunk",
                                 stream_state = C2cStreamingPhase::Completed.name(),
                                 state = 10_u8,
-                                reset = false,
+                                reset = true,
                                 index = final_index,
                                 has_stream_id_before_send = had_stream_id,
                                 has_stream_id_after_send = stream_state.stream_id.is_some(),
-                                content_chars = 0_usize,
+                                content_chars = final_chars,
                                 final_chars,
                                 "QQ stream end after broken active succeeded"
                             ),
@@ -944,10 +950,10 @@ where
                                 phase = "broken_active_final_chunk",
                                 stream_state = "broken_active",
                                 state = 10_u8,
-                                reset = false,
+                                reset = true,
                                 index = final_index,
                                 has_stream_id_before_send = had_stream_id,
-                                content_chars = 0_usize,
+                                content_chars = final_chars,
                                 error = %err.log_summary(),
                                 final_chars,
                                 "QQ stream end after broken active failed; ordinary fallback is disabled"
@@ -997,23 +1003,30 @@ where
                 if let C2cStreamingPhase::Active(mut stream_state)
                 | C2cStreamingPhase::BrokenActive(mut stream_state) = phase
                 {
-                    send_stream_end(sender, user_openid, Some(reply_msg_id), &mut stream_state)
-                        .await
-                        .inspect_err(|err| {
-                            warn!(
-                                user = %masked_user,
-                                reply_msg_id,
-                                phase = "failed_final_chunk",
-                                state = 10_u8,
-                                reset = false,
-                                index = stream_state.index,
-                                has_stream_id = stream_state.stream_id.is_some(),
-                                content_chars = 0_usize,
-                                error = %err.log_summary(),
-                                accumulated_chars = accumulated.chars().count(),
-                                "QQ stream finalization after core failure failed"
-                            );
-                        })?;
+                    send_stream_end(
+                        sender,
+                        user_openid,
+                        Some(reply_msg_id),
+                        "",
+                        &mut stream_state,
+                        false,
+                    )
+                    .await
+                    .inspect_err(|err| {
+                        warn!(
+                            user = %masked_user,
+                            reply_msg_id,
+                            phase = "failed_final_chunk",
+                            state = 10_u8,
+                            reset = false,
+                            index = stream_state.index,
+                            has_stream_id = stream_state.stream_id.is_some(),
+                            content_chars = 0_usize,
+                            error = %err.log_summary(),
+                            accumulated_chars = accumulated.chars().count(),
+                            "QQ stream finalization after core failure failed"
+                        );
+                    })?;
                 }
                 return Err(anyhow::anyhow!(
                     "core respond stream failed before Completed: kind={:?}, retryable={}",
@@ -1035,7 +1048,15 @@ where
     match phase {
         C2cStreamingPhase::Active(mut stream_state)
         | C2cStreamingPhase::BrokenActive(mut stream_state) => {
-            send_stream_end(sender, user_openid, Some(reply_msg_id), &mut stream_state).await?;
+            send_stream_end(
+                sender,
+                user_openid,
+                Some(reply_msg_id),
+                "",
+                &mut stream_state,
+                false,
+            )
+            .await?;
         }
         C2cStreamingPhase::Pending(_) if !accumulated.is_empty() && !stream_first_attempted => {
             let response = response_from_incomplete_stream_text(&accumulated);
@@ -1048,12 +1069,8 @@ where
     ))
 }
 
-fn completed_response_chars(response: &RespondResponse) -> Option<usize> {
-    response
-        .markdown
-        .as_deref()
-        .or(response.text.as_deref())
-        .map(|value| value.chars().count())
+fn completed_response_content(response: &RespondResponse) -> Option<&str> {
+    response.markdown.as_deref().or(response.text.as_deref())
 }
 
 fn response_from_incomplete_stream_text(content: &str) -> RespondResponse {
@@ -1069,8 +1086,8 @@ fn response_from_incomplete_stream_text(content: &str) -> RespondResponse {
 
 /// 发送流式消息分片到 QQ。
 ///
-/// `reset=false` 时 QQ 会把本次 content 追加到现有流式消息后面，因此这里传入的
-/// content 必须是尚未发送过的增量；是否用 `reset=true` 替换全文需按真实协议实验单独验证。
+/// `reset=false` 时 QQ 会把本次 `markdown.content` 追加到现有流式消息后面，
+/// 因此这里传入的 content 必须是尚未发送过的增量。
 /// 首帧只有拿到 stream id 才能进入 Active；后续帧即使 QQ 返回新的消息 id，
 /// 也必须保留首帧 id，避免最终帧的 id/index 序列被 QQ 判定为无效。
 async fn send_stream_chunk<S: C2cStreamSender + ?Sized>(
@@ -1082,8 +1099,9 @@ async fn send_stream_chunk<S: C2cStreamSender + ?Sized>(
     state: u8,
     reset: bool,
 ) -> StreamSendResult {
+    let markdown = MarkdownPayload::new(content);
     let result = sender
-        .send_stream_text(user_openid, msg_id, content, stream_state, state, reset)
+        .send_stream_markdown(user_openid, msg_id, &markdown, stream_state, state, reset)
         .await?;
     if stream_state.stream_id.is_none()
         && let Some(id) = result.as_deref().filter(|id| !id.trim().is_empty())
@@ -1098,16 +1116,19 @@ async fn send_stream_chunk<S: C2cStreamSender + ?Sized>(
 
 /// 发送流式结束帧（state=10）。
 ///
-/// 参考图协议先验证空 content + reset=false；如果真实 QQ 拒绝该组合，再基于脱敏响应
-/// 调整，而不是提前回退到 Markdown 或普通文本消息。
+/// Completed 使用完整 Markdown + reset=true 校正最终气泡；异常收尾仍可传空内容只结束流，
+/// 但不会回退成第二条普通消息，保持流式气泡的唯一发送所有权。
 async fn send_stream_end<S: C2cStreamSender + ?Sized>(
     sender: &S,
     user_openid: &str,
     msg_id: Option<&str>,
+    content: &str,
     stream_state: &mut C2cStreamState,
+    reset: bool,
 ) -> Result<(), crate::api::ApiError> {
+    let markdown = MarkdownPayload::new(content);
     let result = sender
-        .send_stream_text(user_openid, msg_id, "", stream_state, 10, false)
+        .send_stream_markdown(user_openid, msg_id, &markdown, stream_state, 10, reset)
         .await?;
     if stream_state.stream_id.is_none()
         && let Some(id) = result.as_deref().filter(|id| !id.trim().is_empty())
@@ -1471,18 +1492,18 @@ mod tests {
     }
 
     impl C2cStreamSender for FakeStreamSender {
-        fn send_stream_text<'a>(
+        fn send_stream_markdown<'a>(
             &'a self,
             _user_openid: &'a str,
             msg_id: Option<&'a str>,
-            content: &'a str,
+            markdown: &'a MarkdownPayload,
             stream_state: &'a C2cStreamState,
             state: u8,
             reset: bool,
         ) -> StreamSendFuture<'a> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(FakeCall::Stream {
-                    content: content.to_owned(),
+                    content: markdown.content.clone(),
                     msg_id: msg_id.map(str::to_owned),
                     stream_id: stream_state.stream_id.clone(),
                     index: stream_state.index,
@@ -1656,12 +1677,12 @@ mod tests {
                     reset: false,
                 },
                 FakeCall::Stream {
-                    content: "".to_owned(),
+                    content: "晚上好".to_owned(),
                     msg_id: Some("msg-1".to_owned()),
                     stream_id: Some("stream-1".to_owned()),
                     index: 2,
                     state: 10,
-                    reset: false,
+                    reset: true,
                 },
             ]
         );
@@ -1710,12 +1731,12 @@ mod tests {
                     reset: false,
                 },
                 FakeCall::Stream {
-                    content: "".to_owned(),
+                    content: "晚上".to_owned(),
                     msg_id: Some("msg-1".to_owned()),
                     stream_id: Some("stream-1".to_owned()),
                     index: 2,
                     state: 10,
-                    reset: false,
+                    reset: true,
                 },
             ]
         );
@@ -1761,12 +1782,12 @@ mod tests {
                     reset: false,
                 },
                 FakeCall::Stream {
-                    content: "".to_owned(),
+                    content: "晚上好".to_owned(),
                     msg_id: Some("msg-1".to_owned()),
                     stream_id: Some("stream-1".to_owned()),
                     index: 2,
                     state: 10,
-                    reset: false,
+                    reset: true,
                 },
             ]
         );
@@ -1799,12 +1820,12 @@ mod tests {
                     reset: false,
                 },
                 FakeCall::Stream {
-                    content: "".to_owned(),
+                    content: "晚上好".to_owned(),
                     msg_id: Some("msg-1".to_owned()),
                     stream_id: Some("stream-1".to_owned()),
                     index: 1,
                     state: 10,
-                    reset: false,
+                    reset: true,
                 },
             ]
         );
@@ -1843,12 +1864,12 @@ mod tests {
                     reset: false,
                 },
                 FakeCall::Stream {
-                    content: "".to_owned(),
+                    content: "晚上".to_owned(),
                     msg_id: Some("msg-1".to_owned()),
                     stream_id: Some("stream-1".to_owned()),
                     index: 2,
                     state: 10,
-                    reset: false,
+                    reset: true,
                 },
             ]
         );
@@ -1937,12 +1958,12 @@ mod tests {
                     reset: false,
                 },
                 FakeCall::Stream {
-                    content: "".to_owned(),
+                    content: "晚上".to_owned(),
                     msg_id: Some("msg-1".to_owned()),
                     stream_id: Some("stream-1".to_owned()),
                     index: 1,
                     state: 10,
-                    reset: false,
+                    reset: true,
                 },
             ]
         );
