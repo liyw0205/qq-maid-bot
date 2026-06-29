@@ -146,7 +146,7 @@ where
     let mut phase = C2cStreamingPhase::Pending(C2cStreamState::new());
     let mut accumulated = String::new();
     // QQ stream 的 reset=false 是“续接本次 Markdown content”，因此内容分片不能反复提交全文。
-    // 真实环境确认结束包仍需要非空 Markdown：用完整 final_text 收尾，但不额外携带 reset/index。
+    // 完成包同样携带连续 index/reset=false，但正文使用完整 final_text，满足 QQ 对非空 Markdown 的要求。
     let mut pending_delta = String::new();
     let mut last_send_at = Instant::now();
     let mut stream_first_attempted = false;
@@ -371,9 +371,8 @@ where
                                                 phase = "completed_flush_final_chunk",
                                                 stream_state = C2cStreamingPhase::Completed.name(),
                                                 stream_state_value = 10_u8,
-                                                done = true,
-                                                reset_present = false,
-                                                index_present = false,
+                                                reset = false,
+                                                index = stream_state.index,
                                                 has_stream_id_before_send = stream_state.stream_id.is_some(),
                                                 has_stream_id_after_send = stream_state.stream_id.is_some(),
                                                 content_chars = final_chars,
@@ -389,9 +388,8 @@ where
                                                 phase = "completed_flush_final_chunk",
                                                 stream_state = "broken_active",
                                                 stream_state_value = 10_u8,
-                                                done = true,
-                                                reset_present = false,
-                                                index_present = false,
+                                                reset = false,
+                                                index = stream_state.index,
                                                 has_stream_id_before_send = stream_state.stream_id.is_some(),
                                                 content_chars = final_chars,
                                                 error = %end_err.log_summary(),
@@ -423,9 +421,8 @@ where
                                     phase = "final_chunk",
                                     stream_state = C2cStreamingPhase::Completed.name(),
                                     stream_state_value = 10_u8,
-                                    done = true,
-                                    reset_present = false,
-                                    index_present = false,
+                                    reset = false,
+                                    index = stream_state.index,
                                     has_stream_id_before_send = had_stream_id,
                                     has_stream_id_after_send = stream_state.stream_id.is_some(),
                                     content_chars = final_chars,
@@ -441,9 +438,8 @@ where
                                     phase = "final_chunk",
                                     stream_state = "broken_active",
                                     stream_state_value = 10_u8,
-                                    done = true,
-                                    reset_present = false,
-                                    index_present = false,
+                                    reset = false,
+                                    index = stream_state.index,
                                     has_stream_id_before_send = had_stream_id,
                                     content_chars = final_chars,
                                     error = %err.log_summary(),
@@ -472,9 +468,8 @@ where
                                     phase = "broken_active_final_chunk",
                                     stream_state = C2cStreamingPhase::Completed.name(),
                                     stream_state_value = 10_u8,
-                                    done = true,
-                                    reset_present = false,
-                                    index_present = false,
+                                    reset = false,
+                                    index = stream_state.index,
                                     has_stream_id_before_send = had_stream_id,
                                     has_stream_id_after_send = stream_state.stream_id.is_some(),
                                     content_chars = final_chars,
@@ -490,9 +485,8 @@ where
                                     phase = "broken_active_final_chunk",
                                     stream_state = "broken_active",
                                     stream_state_value = 10_u8,
-                                    done = true,
-                                    reset_present = false,
-                                    index_present = false,
+                                    reset = false,
+                                    index = stream_state.index,
                                     has_stream_id_before_send = had_stream_id,
                                     content_chars = final_chars,
                                     error = %err.log_summary(),
@@ -560,9 +554,8 @@ where
                             reply_msg_id = %masked_reply_msg_id,
                             phase = "failed_final_chunk",
                             stream_state_value = 10_u8,
-                            done = true,
-                            reset_present = false,
-                            index_present = false,
+                            reset = false,
+                            index = stream_state.index,
                             has_stream_id = stream_state.stream_id.is_some(),
                             content_chars = accumulated.chars().count(),
                             error = %err.log_summary(),
@@ -663,10 +656,10 @@ async fn send_stream_chunk<S: C2cStreamSender + ?Sized>(
     Ok(result)
 }
 
-/// 发送流式结束帧（state=10, done=true）。
+/// 发送流式结束帧（state=10）。
 ///
 /// 真实环境要求结束包的 Markdown 非空：这里携带完整最终正文，
-/// 但 stream 控制字段仍只表达关闭语义，不再凭空携带 index/reset。
+/// 并按参考实现继续携带同一个 stream id、连续 index 和 reset=false。
 /// 首帧成功后不会回退成第二条普通消息，保持流式气泡的唯一发送所有权。
 async fn send_stream_end<S: C2cStreamSender + ?Sized>(
     sender: &S,
@@ -678,7 +671,14 @@ async fn send_stream_end<S: C2cStreamSender + ?Sized>(
     // QQ 会校验 markdown.content 非空；final 包使用完整最终正文，避免 40034011。
     let markdown = MarkdownPayload::new(content);
     let result = sender
-        .send_stream_markdown(user_openid, msg_id, &markdown, stream_state, 10, None)
+        .send_stream_markdown(
+            user_openid,
+            msg_id,
+            &markdown,
+            stream_state,
+            10,
+            Some(false),
+        )
         .await?;
     if stream_state.stream_id.is_none()
         && let Some(id) = result.as_deref().filter(|id| !id.trim().is_empty())
@@ -686,6 +686,7 @@ async fn send_stream_end<S: C2cStreamSender + ?Sized>(
         // 正常收尾前已经有首帧 id；这里只兼容“直接最终帧”或异常状态下的空 id。
         stream_state.stream_id = Some(id.to_owned());
     }
+    stream_state.index += 1;
     Ok(())
 }
 
@@ -993,7 +994,7 @@ mod tests {
                     stream_id: Some("stream-1".to_owned()),
                     index: 1,
                     stream_state_value: 10,
-                    reset: None,
+                    reset: Some(false),
                 },
             ]
         );
@@ -1043,7 +1044,7 @@ mod tests {
                     stream_id: Some("stream-1".to_owned()),
                     index: 2,
                     stream_state_value: 10,
-                    reset: None,
+                    reset: Some(false),
                 },
             ]
         );
@@ -1079,7 +1080,7 @@ mod tests {
                     stream_id: Some("stream-1".to_owned()),
                     index: 1,
                     stream_state_value: 10,
-                    reset: None,
+                    reset: Some(false),
                 },
             ]
         );
@@ -1133,7 +1134,7 @@ mod tests {
                     stream_id: Some("stream-1".to_owned()),
                     index: 2,
                     stream_state_value: 10,
-                    reset: None,
+                    reset: Some(false),
                 },
             ]
         );
@@ -1184,7 +1185,7 @@ mod tests {
                     stream_id: Some("stream-1".to_owned()),
                     index: 2,
                     stream_state_value: 10,
-                    reset: None,
+                    reset: Some(false),
                 },
             ]
         );
@@ -1222,7 +1223,7 @@ mod tests {
                     stream_id: Some("stream-1".to_owned()),
                     index: 1,
                     stream_state_value: 10,
-                    reset: None,
+                    reset: Some(false),
                 },
             ]
         );
@@ -1266,7 +1267,7 @@ mod tests {
                     stream_id: Some("stream-1".to_owned()),
                     index: 2,
                     stream_state_value: 10,
-                    reset: None,
+                    reset: Some(false),
                 },
             ]
         );
@@ -1353,7 +1354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_final_success_does_not_commit_extra_next_index() {
+    async fn stream_final_success_commits_next_index() {
         let sender = FakeStreamSender::new([Ok(None)]);
         let mut stream_state = C2cStreamState::new();
         stream_state.stream_id = Some("stream-1".to_owned());
@@ -1369,7 +1370,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(stream_state.index, 2);
+        assert_eq!(stream_state.index, 3);
         assert_eq!(
             sender.calls(),
             vec![FakeCall::Stream {
@@ -1378,7 +1379,7 @@ mod tests {
                 stream_id: Some("stream-1".to_owned()),
                 index: 2,
                 stream_state_value: 10,
-                reset: None,
+                reset: Some(false),
             }]
         );
     }
@@ -1453,7 +1454,7 @@ mod tests {
                     stream_id: Some("stream-1".to_owned()),
                     index: 1,
                     stream_state_value: 10,
-                    reset: None,
+                    reset: Some(false),
                 },
             ]
         );
