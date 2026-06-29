@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::anyhow;
+use thiserror::Error;
 use tokio::{
     sync::{Semaphore, mpsc, oneshot},
     task::JoinHandle,
@@ -45,32 +46,77 @@ const SHUTDOWN_DRAIN_TIMEOUT_SECS: u64 = 10;
 const WORKER_CANCEL_TIMEOUT_SECS: u64 = 1;
 const COMMAND_CHANNEL_MULTIPLIER: usize = 4;
 
+type DispatcherEnqueueResult = Result<(), DispatcherEnqueueError>;
+
+#[derive(Debug, Error)]
+pub(super) enum DispatcherEnqueueError {
+    /// Dispatcher 已经通过拒绝通道给用户发送过容量提示，上层不得重复发送服务不可用提示。
+    #[error("dispatcher rejected message and queued user notification: {reason}")]
+    RejectedAndNotified { reason: &'static str },
+    /// Dispatcher 已关闭或不可用且没有自行提示用户，上层需要决定是否给出兜底提示。
+    #[error("dispatcher unavailable: {reason}")]
+    Unavailable { reason: &'static str },
+}
+
 #[derive(Clone)]
 pub(super) struct MessageDispatcherHandle {
     command_tx: mpsc::Sender<DispatcherCommand>,
     reject_tx: mpsc::Sender<RejectNotification>,
-    reject_metrics: Arc<RejectMetrics>,
 }
 
 impl MessageDispatcherHandle {
-    pub(super) async fn enqueue_c2c(&self, message: C2cMessage) -> anyhow::Result<()> {
+    pub(super) async fn enqueue_c2c(&self, message: C2cMessage) -> DispatcherEnqueueResult {
+        self.enqueue_c2c_inner(message, None, true).await
+    }
+
+    pub(super) async fn enqueue_c2c_silent(&self, message: C2cMessage) -> DispatcherEnqueueResult {
+        self.enqueue_c2c_inner(message, None, false).await
+    }
+
+    pub(super) async fn enqueue_c2c_with_processed_ack(
+        &self,
+        message: C2cMessage,
+        processed_ack: oneshot::Sender<()>,
+    ) -> DispatcherEnqueueResult {
+        self.enqueue_c2c_inner(message, Some(processed_ack), true)
+            .await
+    }
+
+    async fn enqueue_c2c_inner(
+        &self,
+        message: C2cMessage,
+        processed_ack: Option<oneshot::Sender<()>>,
+        notify_on_reject: bool,
+    ) -> DispatcherEnqueueResult {
         let scope_key = scope_key_from_c2c_message(&message);
         let target = RejectTarget::C2c {
             user_openid: message.user_openid.clone(),
             message_id: message.message_id.clone(),
         };
-        self.enqueue(InboundEnvelope::C2c(message), scope_key, target)
-            .await
+        self.enqueue(
+            InboundEnvelope::C2c(message),
+            scope_key,
+            target,
+            processed_ack,
+            notify_on_reject,
+        )
+        .await
     }
 
-    pub(super) async fn enqueue_group(&self, message: GroupMessage) -> anyhow::Result<()> {
+    pub(super) async fn enqueue_group(&self, message: GroupMessage) -> DispatcherEnqueueResult {
         let scope_key = scope_key_from_group_message(&message);
         let target = RejectTarget::Group {
             group_openid: message.group_openid.clone(),
             message_id: message.message_id.clone(),
         };
-        self.enqueue(InboundEnvelope::Group(message), scope_key, target)
-            .await
+        self.enqueue(
+            InboundEnvelope::Group(message),
+            scope_key,
+            target,
+            None,
+            true,
+        )
+        .await
     }
 
     async fn enqueue(
@@ -78,63 +124,53 @@ impl MessageDispatcherHandle {
         envelope: InboundEnvelope,
         scope_key: String,
         reject_target: RejectTarget,
-    ) -> anyhow::Result<()> {
+        processed_ack: Option<oneshot::Sender<()>>,
+        notify_on_reject: bool,
+    ) -> DispatcherEnqueueResult {
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = DispatcherCommand::Enqueue {
             scope_key,
-            // command channel 只负责把消息转交给调度 actor；
-            // 这里装箱是为了避免控制命令枚举被大消息体撑大，触发 Clippy large_enum_variant。
+            // command channel 满时优先做短暂背压等待，不把瞬时积压直接放大成用户可见失败。
+            // 真正 closed/unavailable 的情况仍然快速返回错误，由上层决定是否提示用户稍后再试。
             message: Box::new(QueuedMessage {
                 envelope,
                 reject_target,
+                processed_ack,
+                notify_on_reject,
             }),
             ack: ack_tx,
         };
-        if let Err(error) = self.command_tx.try_send(command) {
-            match error {
-                mpsc::error::TrySendError::Full(DispatcherCommand::Enqueue {
-                    scope_key,
-                    message,
-                    ..
-                }) => {
-                    self.reject_from_handle(
-                        scope_key,
-                        message.reject_target,
-                        "dispatcher_command_queue_full",
-                    );
-                    return Err(anyhow!("dispatcher command queue full"));
-                }
-                mpsc::error::TrySendError::Full(_) => {
-                    return Err(anyhow!("dispatcher command queue full"));
-                }
-                mpsc::error::TrySendError::Closed(_) => return Err(anyhow!("dispatcher closed")),
-            }
-        }
+        self.command_tx
+            .send(command)
+            .await
+            .map_err(|_| DispatcherEnqueueError::Unavailable {
+                reason: "dispatcher_closed",
+            })?;
         match ack_rx.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(anyhow!("dispatcher unavailable")),
+            Ok(result) => result,
+            Err(_) => Err(DispatcherEnqueueError::Unavailable {
+                reason: "dispatcher_unavailable",
+            }),
         }
     }
 
-    fn reject_from_handle(&self, scope_key: String, target: RejectTarget, reason: &'static str) {
-        self.reject_metrics.total.fetch_add(1, Ordering::Relaxed);
+    pub(super) async fn notify_c2c_failure(
+        &self,
+        message: &C2cMessage,
+        text: &str,
+    ) -> anyhow::Result<()> {
         let notification = RejectNotification {
-            scope_key: scope_key.clone(),
-            target,
-            message: REJECT_QUEUE_TEXT.to_owned(),
+            scope_key: scope_key_from_c2c_message(message),
+            target: RejectTarget::C2c {
+                user_openid: message.user_openid.clone(),
+                message_id: message.message_id.clone(),
+            },
+            message: text.to_owned(),
         };
-        if self.reject_tx.try_send(notification).is_err() {
-            let reject_total = self.reject_metrics.total.load(Ordering::Relaxed);
-            let reject_dropped = self.reject_metrics.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            warn!(
-                scope_key = %mask_scope_key(&scope_key),
-                reject_total,
-                reject_dropped,
-                reason,
-                "dispatcher reject queue full"
-            );
-        }
+        self.reject_tx
+            .send(notification)
+            .await
+            .map_err(|_| anyhow!("dispatcher reject channel closed"))
     }
 }
 
@@ -195,7 +231,6 @@ impl MessageDispatcher {
             handle: MessageDispatcherHandle {
                 command_tx,
                 reject_tx: handle_reject_tx,
-                reject_metrics,
             },
             join_handle,
             shutdown_token,
@@ -227,7 +262,7 @@ enum DispatcherCommand {
         scope_key: String,
         // QueuedMessage 可能携带完整平台消息，装箱后可避免 command 枚举整体尺寸过大。
         message: Box<QueuedMessage>,
-        ack: oneshot::Sender<anyhow::Result<()>>,
+        ack: oneshot::Sender<DispatcherEnqueueResult>,
     },
     WorkerIdleExpired {
         scope_key: String,
@@ -251,10 +286,15 @@ enum InboundEnvelope {
     Group(GroupMessage),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct QueuedMessage {
     envelope: InboundEnvelope,
     reject_target: RejectTarget,
+    // 仅供聚合器建立边界屏障：Dispatcher 入队 ack 只表示已接收，
+    // processed_ack 要等 worker 真正处理完边界消息后才触发。
+    processed_ack: Option<oneshot::Sender<()>>,
+    // shutdown flush 失败只回滚不提示；正常入站容量拒绝仍由 Dispatcher 提示“稍后再试”。
+    notify_on_reject: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -479,23 +519,40 @@ impl DispatcherActor {
         }
     }
 
-    async fn enqueue(&mut self, scope_key: String, message: QueuedMessage) -> anyhow::Result<()> {
+    async fn enqueue(
+        &mut self,
+        scope_key: String,
+        message: QueuedMessage,
+    ) -> DispatcherEnqueueResult {
         if self.shutdown_token.is_cancelled() {
-            return Err(anyhow!("dispatcher shutdown"));
+            return Err(DispatcherEnqueueError::Unavailable {
+                reason: "dispatcher_shutdown",
+            });
         }
         if let Some(entry) = self.scopes.get_mut(&scope_key) {
             let total_len = entry.queue_len + entry.backlog.len();
             if total_len >= self.config.conversation_queue_capacity {
-                self.reject(scope_key, message.reject_target, "conversation_queue_full")
-                    .await;
-                return Err(anyhow!("conversation queue full"));
+                if message.notify_on_reject
+                    && self
+                        .reject(scope_key, message.reject_target, "conversation_queue_full")
+                        .await
+                {
+                    return Err(DispatcherEnqueueError::RejectedAndNotified {
+                        reason: "conversation_queue_full",
+                    });
+                }
+                return Err(DispatcherEnqueueError::Unavailable {
+                    reason: "conversation_queue_full_reject_dropped",
+                });
             }
             match entry.state {
                 ScopeState::Active => {
                     if let Some(sender) = entry.sender.as_ref() {
-                        sender
-                            .try_send(message)
-                            .map_err(|_| anyhow!("worker queue unavailable"))?;
+                        sender.try_send(message).map_err(|_| {
+                            DispatcherEnqueueError::Unavailable {
+                                reason: "worker_queue_unavailable",
+                            }
+                        })?;
                         entry.queue_len += 1;
                         debug!(
                             scope_key = %mask_scope_key(&scope_key),
@@ -522,9 +579,18 @@ impl DispatcherActor {
         let permit = match self.worker_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                self.reject(scope_key, message.reject_target, "worker_slot_exhausted")
-                    .await;
-                return Err(anyhow!("worker slot exhausted"));
+                if message.notify_on_reject
+                    && self
+                        .reject(scope_key, message.reject_target, "worker_slot_exhausted")
+                        .await
+                {
+                    return Err(DispatcherEnqueueError::RejectedAndNotified {
+                        reason: "worker_slot_exhausted",
+                    });
+                }
+                return Err(DispatcherEnqueueError::Unavailable {
+                    reason: "worker_slot_exhausted_reject_dropped",
+                });
             }
         };
         let generation = self.next_generation();
@@ -533,7 +599,9 @@ impl DispatcherActor {
             self.spawn_worker(scope_key.clone(), generation, worker_cancel.clone(), permit);
         sender
             .try_send(message)
-            .map_err(|_| anyhow!("worker queue unavailable"))?;
+            .map_err(|_| DispatcherEnqueueError::Unavailable {
+                reason: "worker_queue_unavailable",
+            })?;
         self.scopes.insert(
             scope_key.clone(),
             ScopeEntry {
@@ -706,7 +774,12 @@ impl DispatcherActor {
         tx
     }
 
-    async fn reject(&mut self, scope_key: String, target: RejectTarget, reason: &'static str) {
+    async fn reject(
+        &mut self,
+        scope_key: String,
+        target: RejectTarget,
+        reason: &'static str,
+    ) -> bool {
         self.reject_metrics.total.fetch_add(1, Ordering::Relaxed);
         let notification = RejectNotification {
             scope_key: scope_key.clone(),
@@ -723,7 +796,9 @@ impl DispatcherActor {
                 reason,
                 "dispatcher reject queue full"
             );
+            return false;
         }
+        true
     }
 
     async fn drain_shutdown(&mut self) {
@@ -832,7 +907,15 @@ async fn run_worker(mut ctx: WorkerContext) -> WorkerExitReason {
             );
             return WorkerExitReason::Cancelled;
         }
-        let result = ctx.handler.handle(message.envelope).await;
+        let QueuedMessage {
+            envelope,
+            processed_ack,
+            ..
+        } = message;
+        let result = ctx.handler.handle(envelope).await;
+        if let Some(ack) = processed_ack {
+            let _ = ack.send(());
+        }
         if let Err(error) = result {
             warn!(
                 scope_key = %mask_scope_key(&ctx.scope_key),
@@ -1014,16 +1097,30 @@ mod tests {
             conversation_queue_capacity: 8,
             max_active_conversation_workers: 4,
             conversation_worker_idle_timeout: Duration::from_secs(60),
+            message_aggregation: crate::config::MessageAggregationConfig {
+                private_enabled: true,
+                group_enabled: false,
+                quiet: Duration::from_millis(1200),
+                max_wait: Duration::from_millis(3000),
+                max_messages: 10,
+                max_chars: 12000,
+                max_active_keys: 1024,
+            },
         }
     }
 
     fn c2c(id: &str, user: &str) -> C2cMessage {
         C2cMessage {
             message_id: id.to_owned(),
+            event_id: Some(format!("event-{id}")),
+            source_message_ids: vec![id.to_owned()],
+            source_event_ids: vec![format!("event-{id}")],
             user_openid: user.to_owned(),
             content: "hello".to_owned(),
             reply: None,
             timestamp: None,
+            first_message_timestamp: None,
+            last_message_timestamp: None,
             attachments: Vec::new(),
         }
     }
@@ -1051,6 +1148,8 @@ mod tests {
                 message_id: message.message_id.clone(),
             },
             envelope: InboundEnvelope::C2c(message),
+            processed_ack: None,
+            notify_on_reject: true,
         }
     }
 
@@ -1062,6 +1161,8 @@ mod tests {
                 message_id: message.message_id.clone(),
             },
             envelope: InboundEnvelope::Group(message),
+            processed_ack: None,
+            notify_on_reject: true,
         }
     }
 
@@ -1374,14 +1475,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_queue_full_attempts_busy_reject() {
-        let (command_tx, _command_rx) = mpsc::channel(1);
+    async fn command_queue_full_applies_backpressure_until_capacity_frees() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
         let (reject_tx, mut reject_rx) = mpsc::channel(1);
         let metrics = Arc::new(RejectMetrics::default());
         let handle = MessageDispatcherHandle {
             command_tx: command_tx.clone(),
             reject_tx,
-            reject_metrics: metrics.clone(),
         };
         command_tx
             .try_send(DispatcherCommand::WorkerDequeued {
@@ -1389,6 +1489,55 @@ mod tests {
                 generation: 1,
             })
             .unwrap();
+
+        let enqueue_task = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .enqueue(
+                        InboundEnvelope::C2c(c2c("m1", "user-a")),
+                        "private:user-a".to_owned(),
+                        RejectTarget::C2c {
+                            user_openid: "user-a".to_owned(),
+                            message_id: "m1".to_owned(),
+                        },
+                        None,
+                        true,
+                    )
+                    .await
+            }
+        });
+
+        timeout(Duration::from_millis(50), async { reject_rx.recv().await })
+            .await
+            .expect_err("backpressure should not trigger immediate reject notification");
+        command_rx
+            .recv()
+            .await
+            .expect("occupied command should be released");
+        let command = command_rx
+            .recv()
+            .await
+            .expect("enqueue should succeed after capacity frees");
+        let DispatcherCommand::Enqueue { ack, .. } = command else {
+            panic!("expected enqueue command");
+        };
+        let _ = ack.send(Ok(()));
+        enqueue_task.await.unwrap().unwrap();
+        assert_eq!(metrics.total.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_command_channel_returns_error_without_busy_reject() {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (reject_tx, mut reject_rx) = mpsc::channel(1);
+        let metrics = Arc::new(RejectMetrics::default());
+        let handle = MessageDispatcherHandle {
+            command_tx,
+            reject_tx,
+        };
+        drop(command_rx);
 
         let err = handle
             .enqueue(
@@ -1398,68 +1547,21 @@ mod tests {
                     user_openid: "user-a".to_owned(),
                     message_id: "m1".to_owned(),
                 },
+                None,
+                true,
             )
             .await
             .unwrap_err();
 
-        assert!(err.to_string().contains("dispatcher command queue full"));
-        let notification = reject_rx.recv().await.unwrap();
-        assert_eq!(notification.scope_key, "private:user-a");
-        assert_eq!(notification.message, REJECT_QUEUE_TEXT);
-        match notification.target {
-            RejectTarget::C2c { message_id, .. } => assert_eq!(message_id, "m1"),
-            RejectTarget::Group { .. } => panic!("expected c2c reject target"),
-        }
-        assert_eq!(metrics.total.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            err,
+            DispatcherEnqueueError::Unavailable {
+                reason: "dispatcher_closed"
+            }
+        ));
+        assert!(reject_rx.try_recv().is_err());
+        assert_eq!(metrics.total.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.dropped.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn reject_queue_full_does_not_block_and_counts_drop() {
-        let (command_tx, _command_rx) = mpsc::channel(1);
-        let (reject_tx, _reject_rx) = mpsc::channel(1);
-        let metrics = Arc::new(RejectMetrics::default());
-        let handle = MessageDispatcherHandle {
-            command_tx: command_tx.clone(),
-            reject_tx,
-            reject_metrics: metrics.clone(),
-        };
-        command_tx
-            .try_send(DispatcherCommand::WorkerDequeued {
-                scope_key: "occupied".to_owned(),
-                generation: 1,
-            })
-            .unwrap();
-        handle
-            .reject_tx
-            .try_send(RejectNotification {
-                scope_key: "full".to_owned(),
-                target: RejectTarget::C2c {
-                    user_openid: "user".to_owned(),
-                    message_id: "held".to_owned(),
-                },
-                message: REJECT_QUEUE_TEXT.to_owned(),
-            })
-            .unwrap();
-
-        let err = timeout(
-            Duration::from_millis(100),
-            handle.enqueue(
-                InboundEnvelope::C2c(c2c("m1", "user-a")),
-                "private:user-a".to_owned(),
-                RejectTarget::C2c {
-                    user_openid: "user-a".to_owned(),
-                    message_id: "m1".to_owned(),
-                },
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-
-        assert!(err.to_string().contains("dispatcher command queue full"));
-        assert_eq!(metrics.total.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.dropped.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1473,7 +1575,12 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.to_string().contains("dispatcher shutdown"));
+        assert!(matches!(
+            err,
+            DispatcherEnqueueError::Unavailable {
+                reason: "dispatcher_shutdown"
+            }
+        ));
         assert!(actor.scopes.is_empty());
     }
 

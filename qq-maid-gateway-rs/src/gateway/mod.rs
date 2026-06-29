@@ -1,5 +1,6 @@
 //! QQ gateway 运行域。负责 WebSocket 主循环、事件分发、去重、诊断与回发编排。
 
+mod aggregator;
 pub mod dedupe;
 mod dispatcher;
 pub mod event;
@@ -16,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use aggregator::MessageAggregator;
 use anyhow::Context;
 use dispatcher::MessageDispatcher;
 use tokio_util::sync::CancellationToken;
@@ -91,7 +93,7 @@ impl BotOutboundCache {
 /// Signal Layer 只是 gateway 内部的临时语义增强层，不是业务核心。
 /// 这里只维护一个短时 `message_id -> content` 缓存，用于 reply.content 本地回填。
 /// gateway 不负责 prompt 构建；真正交给 CoreService 的字符串统一在 respond.rs 的 Egress 层生成。
-fn resolve_signals(message: &mut C2cMessage, cache: &ReplyCache) {
+pub(super) fn resolve_signals(message: &mut C2cMessage, cache: &ReplyCache) {
     let scope_key = crate::respond::scope_key_from_c2c_message(message);
     if !message.message_id.trim().is_empty() {
         cache.lock().unwrap().insert(
@@ -189,6 +191,10 @@ pub async fn run(
     let group_cooldowns = Arc::new(Mutex::new(GroupCooldowns::default()));
     // 断线续连所需的状态（session_id + seq）
     let mut resume = ResumeState::default();
+    // 聚合器必须先 flush 到 Dispatcher，不能让全局 shutdown 同时取消两者。
+    // 顶层 run 负责在停止接收新 Gateway 入站后，按 aggregator -> dispatcher 的顺序关闭。
+    let dispatcher_shutdown = CancellationToken::new();
+    let aggregator_shutdown = CancellationToken::new();
     let dispatcher = MessageDispatcher::new(
         config.clone(),
         auth.clone(),
@@ -199,9 +205,18 @@ pub async fn run(
         group_outbound_cache.clone(),
         group_cooldowns.clone(),
         runtime.clone(),
-        shutdown_token.clone(),
+        dispatcher_shutdown,
     );
     let dispatcher_handle = dispatcher.handle();
+    let aggregator = MessageAggregator::new(
+        config.clone(),
+        respond.clone(),
+        dispatcher_handle,
+        dedupe.clone(),
+        reply_cache.clone(),
+        aggregator_shutdown,
+    );
+    let aggregator_handle = aggregator.handle();
 
     loop {
         if shutdown_token.is_cancelled() {
@@ -229,7 +244,7 @@ pub async fn run(
             &auth,
             &runtime,
             &mut resume,
-            dispatcher_handle.clone(),
+            aggregator_handle.clone(),
             shutdown_token.clone(),
         )
         .await
@@ -247,6 +262,7 @@ pub async fn run(
         }
     }
 
+    aggregator.shutdown().await;
     dispatcher.shutdown().await;
     Ok(())
 }
@@ -434,7 +450,7 @@ pub(super) async fn handle_c2c_message(
     auth: &AccessTokenManager,
     respond: &RespondClient,
     api: &QqApiClient,
-    dedupe: &MessageDedupe,
+    _dedupe: &MessageDedupe,
     reply_cache: &ReplyCache,
     runtime: &GatewayRuntimeStatus,
 ) -> anyhow::Result<()> {
@@ -453,15 +469,7 @@ pub(super) async fn handle_c2c_message(
         );
         return Ok(());
     }
-    if dedupe.is_duplicate(&message.message_id) {
-        info!(
-            message_id = %message.message_id,
-            user = %masked_user,
-            "duplicate C2C message ignored"
-        );
-        return Ok(());
-    }
-
+    // C2C message/event ID 已在 Aggregator 入口原子 reservation；这里不能再按逻辑批次任意 source ID 命中丢弃整批。
     if is_ping_command(&message.content) {
         info!(
             message_id = %message.message_id,
@@ -866,6 +874,9 @@ mod tests {
         );
         let mut message = C2cMessage {
             message_id: "msg-1".to_owned(),
+            event_id: Some("event-1".to_owned()),
+            source_message_ids: vec!["msg-1".to_owned()],
+            source_event_ids: vec!["event-1".to_owned()],
             user_openid: "user-1".to_owned(),
             content: "你好".to_owned(),
             reply: Some(MessageReply {
@@ -873,6 +884,8 @@ mod tests {
                 content: None,
             }),
             timestamp: None,
+            first_message_timestamp: None,
+            last_message_timestamp: None,
             attachments: Vec::new(),
         };
 
@@ -900,6 +913,9 @@ mod tests {
         let cache: ReplyCache = Arc::new(Mutex::new(HashMap::new()));
         let mut message = C2cMessage {
             message_id: "msg-1".to_owned(),
+            event_id: Some("event-1".to_owned()),
+            source_message_ids: vec!["msg-1".to_owned()],
+            source_event_ids: vec!["event-1".to_owned()],
             user_openid: "user-1".to_owned(),
             content: "你好".to_owned(),
             reply: Some(MessageReply {
@@ -907,6 +923,8 @@ mod tests {
                 content: None,
             }),
             timestamp: None,
+            first_message_timestamp: None,
+            last_message_timestamp: None,
             attachments: Vec::new(),
         };
 
@@ -943,6 +961,9 @@ mod tests {
 
         let mut private_message = C2cMessage {
             message_id: "m1".to_owned(),
+            event_id: Some("e1".to_owned()),
+            source_message_ids: vec!["m1".to_owned()],
+            source_event_ids: vec!["e1".to_owned()],
             user_openid: "user-a".to_owned(),
             content: "当前消息".to_owned(),
             reply: Some(MessageReply {
@@ -950,12 +971,17 @@ mod tests {
                 content: None,
             }),
             timestamp: None,
+            first_message_timestamp: None,
+            last_message_timestamp: None,
             attachments: Vec::new(),
         };
         resolve_signals(&mut private_message, &cache);
 
         let mut group_like_private = C2cMessage {
             message_id: "m2".to_owned(),
+            event_id: Some("e2".to_owned()),
+            source_message_ids: vec!["m2".to_owned()],
+            source_event_ids: vec!["e2".to_owned()],
             user_openid: "user-b".to_owned(),
             content: "另一条".to_owned(),
             reply: Some(MessageReply {
@@ -963,6 +989,8 @@ mod tests {
                 content: None,
             }),
             timestamp: None,
+            first_message_timestamp: None,
+            last_message_timestamp: None,
             attachments: Vec::new(),
         };
         resolve_signals(&mut group_like_private, &cache);
