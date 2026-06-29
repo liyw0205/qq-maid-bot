@@ -28,6 +28,9 @@ use crate::{
     },
     util::metrics::MetricsRecorder,
 };
+use qq_maid_common::{
+    redaction::redact_sensitive_text, text::truncate_chars_with_ellipsis_trimmed,
+};
 
 pub use qq_maid_llm::provider::status::{UpstreamState, UpstreamStatusSnapshot};
 
@@ -634,6 +637,7 @@ fn warn_core_error(scope_key: &str, err: &LlmError) {
         scope_key,
         error_code = err.code,
         error_stage = err.stage,
+        error_message = %safe_error_message(err),
         "core respond request failed"
     );
 }
@@ -643,8 +647,14 @@ fn error_core_error(scope_key: &str, err: &LlmError) {
         scope_key,
         error_code = err.code,
         error_stage = err.stage,
+        error_message = %safe_error_message(err),
         "core respond request timed out"
     );
+}
+
+fn safe_error_message(err: &LlmError) -> String {
+    // 只把脱敏后的短错误摘要写入日志，避免 HTTP 上游正文携带 token、URL query 或过长 payload。
+    truncate_chars_with_ellipsis_trimmed(&redact_sensitive_text(&err.message), 500)
 }
 
 #[cfg(test)]
@@ -721,6 +731,19 @@ mod tests {
         assert_eq!(respond.platform, "qq_official");
         assert_eq!(respond.user_id, None);
         assert_eq!(respond.group_id.as_deref(), Some("g1"));
+    }
+
+    #[test]
+    fn safe_error_message_redacts_secret_like_detail() {
+        let err = LlmError::http(
+            "OpenAI chat returned HTTP 400: key sk-test-secret and bearer abc.def.ghi rejected",
+        );
+
+        let message = safe_error_message(&err);
+
+        assert!(message.contains("HTTP 400"));
+        assert!(!message.contains("sk-test-secret"));
+        assert!(!message.contains("abc.def.ghi"));
     }
 
     #[test]
