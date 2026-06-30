@@ -45,7 +45,7 @@ struct FunctionCall {
 
 struct PreparedFunctionCall {
     call_id: String,
-    prepared: PreparedToolCall,
+    prepared: Result<PreparedToolCall, LlmError>,
 }
 
 pub(crate) async fn openai_responses_tool_loop(
@@ -129,17 +129,21 @@ pub(crate) async fn openai_responses_tool_loop(
         let prepared_calls = prepare_function_calls(&req, &calls, round)?;
         let mut previous_call_succeeded = true;
         for call in prepared_calls {
-            executed_tools.push(call.prepared.name.clone());
-            let (output, succeeded) = if call.prepared.dependency
-                == ToolCallDependency::PreviousCallSuccess
-                && !previous_call_succeeded
-            {
-                (tool_skip_output("dependency_previous_call_failed"), false)
-            } else {
-                match req.tools.execute_prepared(call.prepared).await {
-                    Ok(output) => (output, true),
-                    Err(err) => (tool_error_output(&err), false),
+            let (output, succeeded) = match call.prepared {
+                Ok(prepared) => {
+                    executed_tools.push(prepared.name.clone());
+                    if prepared.dependency == ToolCallDependency::PreviousCallSuccess
+                        && !previous_call_succeeded
+                    {
+                        (tool_skip_output("dependency_previous_call_failed"), false)
+                    } else {
+                        match req.tools.execute_prepared(prepared).await {
+                            Ok(output) => (output, true),
+                            Err(err) => (tool_error_output(&err), false),
+                        }
+                    }
                 }
+                Err(err) => (tool_error_output(&err), false),
             };
             previous_call_succeeded = succeeded;
             input.push(json!({
@@ -171,12 +175,11 @@ fn prepare_function_calls(
             round,
             index,
         ));
-        let prepared = req
-            .tools
-            .prepare_json(&context, &call.name, &call.arguments)?;
         prepared_calls.push(PreparedFunctionCall {
             call_id: call.call_id.clone(),
-            prepared,
+            prepared: req
+                .tools
+                .prepare_json(&context, &call.name, &call.arguments),
         });
     }
     Ok(prepared_calls)
@@ -441,6 +444,46 @@ mod tests {
         }
     }
 
+    struct PrepareFailToolStub;
+
+    #[async_trait]
+    impl Tool for PrepareFailToolStub {
+        fn metadata(&self) -> ToolMetadata {
+            ToolMetadata {
+                name: "prepare_fail_tool".to_owned(),
+                description: "prepare failure test".to_owned(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string"}
+                    },
+                    "required": ["value"],
+                    "additionalProperties": false
+                }),
+            }
+        }
+
+        fn prepare(
+            &self,
+            _context: &ToolContext,
+            _arguments: Value,
+        ) -> Result<crate::tool::ToolPreparation, LlmError> {
+            Err(LlmError::new(
+                "bad_tool_arguments",
+                "prepare failed",
+                "tool",
+            ))
+        }
+
+        async fn execute(
+            &self,
+            _context: ToolContext,
+            _arguments: Value,
+        ) -> Result<ToolOutput, LlmError> {
+            panic!("prepare failure tool should never execute");
+        }
+    }
+
     #[derive(Debug)]
     struct ToolLoopMockState {
         requests: Vec<Value>,
@@ -504,6 +547,39 @@ mod tests {
         }))
     }
 
+    async fn mock_prepare_failure_handler(
+        State(state): State<Arc<Mutex<ToolLoopMockState>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let mut state = state.lock().await;
+        state.requests.push(body);
+        if state.requests.len() == 1 {
+            return Json(json!({
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "prepare_fail_tool",
+                        "call_id": "call_prepare_fail_1",
+                        "arguments": "{\"value\":\"bad\"}"
+                    },
+                    {
+                        "type": "function_call",
+                        "name": "get_weather",
+                        "call_id": "call_weather_2",
+                        "arguments": "{\"city\":\"杭州\"}"
+                    }
+                ]
+            }));
+        }
+        Json(json!({
+            "output_text": "准备失败已汇总。",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "准备失败已汇总。"}]
+            }]
+        }))
+    }
+
     async fn spawn_tool_loop_mock() -> (String, Arc<Mutex<ToolLoopMockState>>) {
         let state = Arc::new(Mutex::new(ToolLoopMockState {
             requests: Vec::new(),
@@ -525,6 +601,21 @@ mod tests {
         }));
         let app = Router::new()
             .route("/v1/responses", post(mock_multi_tool_handler))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1"), state)
+    }
+
+    async fn spawn_prepare_failure_mock() -> (String, Arc<Mutex<ToolLoopMockState>>) {
+        let state = Arc::new(Mutex::new(ToolLoopMockState {
+            requests: Vec::new(),
+        }));
+        let app = Router::new()
+            .route("/v1/responses", post(mock_prepare_failure_handler))
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -659,6 +750,51 @@ mod tests {
                 && item["output"]
                     .as_str()
                     .is_some_and(|output| output.contains("\"skipped\":true"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn tool_loop_keeps_independent_calls_after_prepare_failure() {
+        let (base_url, state) = spawn_prepare_failure_mock().await;
+        let registry = ToolRegistry::new()
+            .register(PrepareFailToolStub)
+            .unwrap()
+            .register(WeatherToolStub)
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        let outcome = openai_responses_tool_loop(OpenAiToolLoopRequest {
+            client: &client,
+            api_key: "test-key",
+            base_url: Some(&base_url),
+            provider: "openai",
+            model: "gpt-test",
+            max_output_tokens: 1200,
+            messages: &[ChatMessage::user("先失败再查天气")],
+            tools: registry,
+            tool_context: test_context(),
+            max_rounds: 3,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.reply, "准备失败已汇总。");
+        let state = state.lock().await;
+        assert_eq!(state.requests.len(), 2);
+        let second_input = state.requests[1]["input"].as_array().unwrap();
+        assert!(second_input.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "call_prepare_fail_1"
+                && item["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("\"prepare failed\""))
+        }));
+        assert!(second_input.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "call_weather_2"
+                && item["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("\"weather\":\"小雨\""))
         }));
     }
 }

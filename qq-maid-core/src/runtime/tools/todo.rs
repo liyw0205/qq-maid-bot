@@ -997,7 +997,7 @@ impl TodoToolScope {
             .extra
             .get(TODO_DEDUP_HISTORY_KEY)
             .cloned()
-            .map(|value| serde_json::from_value::<Vec<TodoToolDedupEntry>>(value))
+            .map(serde_json::from_value::<Vec<TodoToolDedupEntry>>)
             .transpose()
             .map_err(|err| {
                 LlmError::new(
