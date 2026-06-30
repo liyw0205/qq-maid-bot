@@ -57,6 +57,7 @@ pub(super) struct MockProvider {
 #[derive(Clone)]
 enum MockToolAction {
     CreateTodo { content: String },
+    ReplyWithoutTool { reply: String },
 }
 
 pub(super) struct MockQueryExecutor;
@@ -170,6 +171,16 @@ impl MockProvider {
             .unwrap()
             .push(MockToolAction::CreateTodo {
                 content: content.into(),
+            });
+        self
+    }
+
+    pub(super) fn with_tool_loop_reply_without_tool(self, reply: impl Into<String>) -> Self {
+        self.tool_actions
+            .lock()
+            .unwrap()
+            .push(MockToolAction::ReplyWithoutTool {
+                reply: reply.into(),
             });
         self
     }
@@ -329,6 +340,7 @@ impl LlmProvider for MockProvider {
                     total_tokens: None,
                 }),
                 fallback_used: false,
+                executed_tools: Vec::new(),
             });
         }
         let last_user = req
@@ -365,6 +377,7 @@ impl LlmProvider for MockProvider {
                 total_tokens: None,
             }),
             fallback_used: false,
+            executed_tools: Vec::new(),
         })
     }
 
@@ -398,17 +411,58 @@ impl LlmProvider for MockProvider {
                     req.tools
                         .execute_json(&req.tool_context, "create_todo", &arguments)
                         .await?;
+                    return Ok(ChatOutcome {
+                        reply: format!("工具回复：{}", last_user_from_tool_request(&req)),
+                        metrics: LlmMetrics {
+                            provider: "mock".to_owned(),
+                            model: req
+                                .chat
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| "mock-model".to_owned()),
+                            stream: false,
+                            ttfe_ms: None,
+                            ttft_ms: None,
+                            total_latency_ms: 1,
+                        },
+                        usage: Some(TokenUsage {
+                            input_tokens: None,
+                            cached_input_tokens: None,
+                            output_tokens: None,
+                            total_tokens: None,
+                        }),
+                        fallback_used: false,
+                        executed_tools: vec!["create_todo".to_owned()],
+                    });
+                }
+                MockToolAction::ReplyWithoutTool { reply } => {
+                    return Ok(ChatOutcome {
+                        reply,
+                        metrics: LlmMetrics {
+                            provider: "mock".to_owned(),
+                            model: req
+                                .chat
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| "mock-model".to_owned()),
+                            stream: false,
+                            ttfe_ms: None,
+                            ttft_ms: None,
+                            total_latency_ms: 1,
+                        },
+                        usage: Some(TokenUsage {
+                            input_tokens: None,
+                            cached_input_tokens: None,
+                            output_tokens: None,
+                            total_tokens: None,
+                        }),
+                        fallback_used: false,
+                        executed_tools: Vec::new(),
+                    });
                 }
             }
         }
-        let last_user = req
-            .chat
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.role == ChatRole::User)
-            .map(|message| message.content.clone())
-            .unwrap_or_default();
+        let last_user = last_user_from_tool_request(&req);
         Ok(ChatOutcome {
             reply: format!("工具回复：{last_user}"),
             metrics: LlmMetrics {
@@ -430,6 +484,7 @@ impl LlmProvider for MockProvider {
                 total_tokens: None,
             }),
             fallback_used: false,
+            executed_tools: Vec::new(),
         })
     }
 
@@ -444,6 +499,16 @@ impl LlmProvider for MockProvider {
     fn stream_enabled(&self) -> bool {
         false
     }
+}
+
+fn last_user_from_tool_request(req: &ToolChatRequest) -> String {
+    req.chat
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ChatRole::User)
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
 }
 
 #[async_trait]

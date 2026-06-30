@@ -131,19 +131,24 @@ impl RustRespondService {
         let service = LlmChatService::new(self.provider.clone());
         let use_tool_loop =
             self.tool_calling_enabled && !is_group_chat && service.supports_tool_calling(None);
-        let output = if use_tool_loop {
-            service
-                .respond_with_tools(
-                    chat_req,
-                    self.tool_registry.clone(),
-                    self.tool_calling_max_rounds,
-                )
-                .await?
+        let todo_requirement = if use_tool_loop {
+            required_todo_tool_kind(&user_text)
         } else {
-            service.respond(chat_req).await?
+            None
+        };
+        let (output, tool_retry_count, required_tool_called) = if use_tool_loop {
+            // 明显的 Todo 写操作必须真的执行对应 Tool；否则模型可能只口头声称
+            // “已生成草稿/已完成”，但 pending/session 实际没有发生状态变更。
+            let (output, retry_count, required_tool_called) = self
+                .respond_with_required_todo_tool(&service, chat_req, todo_requirement)
+                .await?;
+            (output, retry_count, required_tool_called)
+        } else {
+            (service.respond(chat_req).await?, 0, false)
         };
 
         let reply = output.reply.clone();
+        let executed_tools = output.executed_tools.clone();
         if use_tool_loop {
             let mut latest_session = self
                 .session_store
@@ -181,8 +186,85 @@ impl RustRespondService {
             "knowledge_hit_count": knowledge_context.hit_count,
             "used_search": false,
             "tool_calling_enabled": use_tool_loop,
+            "tool_loop_executed_tools": executed_tools,
+            "required_tool_kind": todo_requirement.map(TodoMutationToolKind::as_str),
+            "required_tool_called": required_tool_called,
+            "tool_retry_count": tool_retry_count,
+            "error_code": if use_tool_loop && todo_requirement.is_some() && !required_tool_called {
+                json!("required_tool_not_called")
+            } else {
+                Value::Null
+            },
         }));
         Ok(response)
+    }
+
+    async fn respond_with_required_todo_tool(
+        &self,
+        service: &LlmChatService,
+        chat_req: RespondRequest,
+        required_tool_kind: Option<TodoMutationToolKind>,
+    ) -> Result<(super::llm_service::RespondOutput, usize, bool), LlmError> {
+        let mut retry_count = 0;
+        let mut request = chat_req.clone();
+        let mut output = service
+            .respond_with_tools(
+                request.clone(),
+                self.tool_registry.clone(),
+                self.tool_calling_max_rounds,
+            )
+            .await?;
+        let mut required_called = required_tool_kind
+            .as_ref()
+            .is_none_or(|kind| kind.matches_executed_tools(&output.executed_tools));
+
+        if required_called {
+            return Ok((output, retry_count, true));
+        }
+
+        retry_count = 1;
+        // 只做一次受控重试；仍未调用 Tool 时直接返回中文失败提示，禁止透传假成功。
+        request.system_prompts.push(
+            "本轮用户是在执行待办写操作。你必须调用对应的 Todo Tool；在 Tool 返回成功前，禁止回复“已生成草稿”“已记录”“已完成”“已取消”“已恢复”“已删除”等成功性文案。".to_owned(),
+        );
+        request.metadata = merge_metadata(
+            request.metadata,
+            &[("tool_retry_reason", "required_todo_tool_not_called")],
+        );
+        output = service
+            .respond_with_tools(
+                request,
+                self.tool_registry.clone(),
+                self.tool_calling_max_rounds,
+            )
+            .await?;
+        required_called = required_tool_kind
+            .as_ref()
+            .is_none_or(|kind| kind.matches_executed_tools(&output.executed_tools));
+        if required_called {
+            return Ok((output, retry_count, true));
+        }
+
+        let reply = todo_required_tool_not_called_reply(required_tool_kind);
+        let response = super::llm_service::RespondOutput {
+            reply: reply.clone(),
+            text: reply.clone(),
+            markdown: None,
+            chat: super::types::ChatResponse::ok(
+                reply,
+                crate::util::metrics::LlmMetrics {
+                    provider: "rust".to_owned(),
+                    model: "tool-loop-guard".to_owned(),
+                    stream: false,
+                    ttfe_ms: None,
+                    ttft_ms: None,
+                    total_latency_ms: 0,
+                },
+                None,
+            ),
+            executed_tools: output.executed_tools.clone(),
+        };
+        Ok((response, retry_count, false))
     }
 
     /// 普通聊天真流式路径：复用非流式聊天的上下文构造和后处理，只替换 LLM 调用方式。
@@ -404,6 +486,101 @@ impl RustRespondService {
             }
         });
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TodoMutationToolKind {
+    Create,
+    Complete,
+    Cancel,
+    Restore,
+    Delete,
+}
+
+impl TodoMutationToolKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Complete => "complete",
+            Self::Cancel => "cancel",
+            Self::Restore => "restore",
+            Self::Delete => "delete",
+        }
+    }
+
+    fn required_tool_name(self) -> &'static str {
+        match self {
+            Self::Create => "create_todo",
+            Self::Complete => "complete_todos",
+            Self::Cancel => "cancel_todo",
+            Self::Restore => "restore_todos",
+            Self::Delete => "delete_todos",
+        }
+    }
+
+    fn matches_executed_tools(self, executed_tools: &[String]) -> bool {
+        executed_tools
+            .iter()
+            .any(|tool| tool == self.required_tool_name())
+    }
+}
+
+fn required_todo_tool_kind(user_text: &str) -> Option<TodoMutationToolKind> {
+    let text = user_text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if looks_like_todo_query_text(text) {
+        return None;
+    }
+    if contains_any(text, &["恢复", "撤销完成", "恢复完成", "取消完成"]) {
+        return Some(TodoMutationToolKind::Restore);
+    }
+    if contains_any(text, &["完成", "做完", "标记完成", "搞定"]) {
+        return Some(TodoMutationToolKind::Complete);
+    }
+    if contains_any(text, &["删除", "删掉", "移除", "永久删除"]) {
+        return Some(TodoMutationToolKind::Delete);
+    }
+    if contains_any(text, &["取消", "不做了", "算了", "作废"]) {
+        return Some(TodoMutationToolKind::Cancel);
+    }
+    if contains_any(
+        text,
+        &["待办", "记一个", "记个", "帮我记", "新增", "添加", "提醒我"],
+    ) {
+        return Some(TodoMutationToolKind::Create);
+    }
+    None
+}
+
+fn looks_like_todo_query_text(text: &str) -> bool {
+    let compact = text.trim();
+    let mentions_todo = contains_any(compact, &["待办", "任务"]);
+    let asks_list = contains_any(
+        compact,
+        &["看看", "看下", "看一下", "列出", "有哪些", "查看"],
+    );
+    mentions_todo
+        && (asks_list
+            || compact == "我的待办"
+            || compact == "待办列表"
+            || compact == "已完成的待办"
+            || compact == "已取消的待办"
+            || compact == "看看已完成"
+            || compact == "看看已取消")
+}
+
+fn todo_required_tool_not_called_reply(required_tool_kind: Option<TodoMutationToolKind>) -> String {
+    let action = match required_tool_kind {
+        Some(TodoMutationToolKind::Create) => "新增待办",
+        Some(TodoMutationToolKind::Complete) => "完成待办",
+        Some(TodoMutationToolKind::Cancel) => "取消待办",
+        Some(TodoMutationToolKind::Restore) => "恢复待办",
+        Some(TodoMutationToolKind::Delete) => "删除待办",
+        None => "处理待办",
+    };
+    format!("我这次没有真正执行到{action}操作。请再说一次，我会先调用待办工具，再告诉你结果。")
 }
 
 /// 从会话历史中截取最近的 N 条消息，转换为 LLM `ChatMessage` 格式。
