@@ -6,9 +6,13 @@
 use std::sync::OnceLock;
 
 use regex::Regex;
+use serde_json::Value;
 
-use super::contains_any;
-use crate::runtime::{respond::todo_flow::is_natural_todo_query_text, session::SessionRecord};
+use super::{super::llm_service::RespondOutput, contains_any};
+use crate::{
+    provider::ToolExecutionResult,
+    runtime::{respond::todo_flow::is_natural_todo_query_text, session::SessionRecord},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TodoMutationToolKind {
@@ -32,22 +36,57 @@ impl TodoMutationToolKind {
         }
     }
 
-    fn required_tool_name(self) -> &'static str {
-        match self {
-            Self::Create => "create_todo",
-            Self::Complete => "complete_todos",
-            Self::Edit => "edit_todo",
-            Self::Cancel => "cancel_todo",
-            Self::Restore => "restore_todos",
-            Self::Delete => "delete_todos",
-        }
+    pub(super) fn matches_output(self, output: &RespondOutput) -> bool {
+        output
+            .tool_results
+            .iter()
+            .any(|result| self.matches_tool_result(result))
     }
 
-    pub(super) fn matches_executed_tools(self, executed_tools: &[String]) -> bool {
-        executed_tools
-            .iter()
-            .any(|tool| tool == self.required_tool_name())
+    fn matches_tool_result(self, result: &ToolExecutionResult) -> bool {
+        if !result.succeeded || result_has_explicit_failure(&result.output) {
+            return false;
+        }
+        match self {
+            Self::Create => {
+                result.name == "create_todo" && pending_action_matches(&result.output, "create")
+            }
+            Self::Complete => {
+                result.name == "complete_todos"
+                    && non_empty_array_field(&result.output, "completed")
+            }
+            Self::Edit => result.name == "edit_todo" && result.output.get("updated").is_some(),
+            Self::Cancel => {
+                result.name == "cancel_todo" && pending_action_matches(&result.output, "cancel")
+            }
+            Self::Restore => {
+                result.name == "restore_todos" && non_empty_array_field(&result.output, "restored")
+            }
+            Self::Delete => {
+                // 用户说“删除未完成待办”时，正确业务语义是软取消，因此
+                // `cancel_todo` 成功创建取消确认也属于删除意图的合法结果。
+                (result.name == "delete_todos" && pending_action_matches(&result.output, "delete"))
+                    || (result.name == "cancel_todo"
+                        && pending_action_matches(&result.output, "cancel"))
+            }
+        }
     }
+}
+
+fn result_has_explicit_failure(output: &Value) -> bool {
+    output.get("ok").and_then(Value::as_bool) == Some(false)
+}
+
+fn pending_action_matches(output: &Value, action: &str) -> bool {
+    output.get("requires_confirmation").and_then(Value::as_bool) == Some(true)
+        && output.get("pending_action").and_then(Value::as_str) == Some(action)
+}
+
+fn non_empty_array_field(output: &Value, field: &str) -> bool {
+    output
+        .get(field)
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
 }
 
 /// 判断本轮是否需要强制调用某个 Todo 写操作 Tool，防止模型不调 Tool 却发假成功文案。

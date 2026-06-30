@@ -140,7 +140,7 @@ impl RustRespondService {
             None
         };
         let (output, tool_retry_count, required_tool_called) = if use_tool_loop {
-            // 明显的 Todo 写操作必须真的执行对应 Tool；否则模型可能只口头声称
+            // 明显的 Todo 写操作必须产生真实成功的 Tool 结果；否则模型可能只口头声称
             // “已生成草稿/已完成”，但 pending/session 实际没有发生状态变更。
             let (output, retry_count, required_tool_called) = self
                 .respond_with_required_todo_tool(&service, chat_req, todo_requirement)
@@ -219,7 +219,7 @@ impl RustRespondService {
             .await?;
         let mut required_called = required_tool_kind
             .as_ref()
-            .is_none_or(|kind| kind.matches_executed_tools(&output.executed_tools));
+            .is_none_or(|kind| kind.matches_output(&output));
 
         if required_called {
             return Ok((output, retry_count, true));
@@ -243,7 +243,7 @@ impl RustRespondService {
             .await?;
         required_called = required_tool_kind
             .as_ref()
-            .is_none_or(|kind| kind.matches_executed_tools(&output.executed_tools));
+            .is_none_or(|kind| kind.matches_output(&output));
         if required_called {
             return Ok((output, retry_count, true));
         }
@@ -266,6 +266,7 @@ impl RustRespondService {
                 None,
             ),
             executed_tools: output.executed_tools.clone(),
+            tool_results: output.tool_results.clone(),
         };
         Ok((response, retry_count, false))
     }
