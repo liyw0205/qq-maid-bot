@@ -10,7 +10,7 @@ use crate::{
     error::LlmError,
     metrics::MetricsRecorder,
     provider::{
-        ChatOutcome,
+        ChatOutcome, ToolCallingProtocol, ToolChatRequest,
         types::{ChatMessage, TokenUsage},
     },
     tool::{PreparedToolCall, ToolCallDependency, ToolContext, ToolMetadata, ToolRegistry},
@@ -163,6 +163,48 @@ pub(crate) async fn chat_completions_tool_loop(
         "tool loop exceeded maximum rounds",
         "tool_loop",
     ))
+}
+
+/// 把“OpenAI 兼容 Chat Completions provider 的工具调用接线”收敛成公共 helper。
+///
+/// DeepSeek / BigModel 的差异主要在模型前缀校验和默认 base URL，不值得各自复制
+/// 一整段 tool loop 入口逻辑。
+pub(crate) async fn provider_chat_with_chat_completions_tools<F>(
+    client: &ChatCompletionsClient,
+    provider: &'static str,
+    default_model: &str,
+    max_output_tokens: u64,
+    req: ToolChatRequest,
+    resolve_model: F,
+) -> Result<ChatOutcome, LlmError>
+where
+    F: FnOnce(Option<&str>, &str) -> Result<String, LlmError>,
+{
+    let effective_model = resolve_model(req.chat.model.as_deref(), default_model)?;
+    chat_completions_tool_loop(ChatCompletionsToolLoopRequest {
+        client,
+        provider,
+        model: &effective_model,
+        max_output_tokens,
+        messages: &req.chat.messages,
+        tools: req.tools,
+        tool_context: req.tool_context,
+        max_rounds: req.max_rounds,
+    })
+    .await
+}
+
+pub(crate) fn provider_chat_completions_tool_calling_protocol<F>(
+    model: Option<&str>,
+    default_model: &str,
+    resolve_model: F,
+) -> Option<ToolCallingProtocol>
+where
+    F: FnOnce(Option<&str>, &str) -> Result<String, LlmError>,
+{
+    resolve_model(model, default_model)
+        .ok()
+        .map(|_| ToolCallingProtocol::ChatCompletionsToolCalls)
 }
 
 fn chat_completions_tool_defs(metadata: Vec<ToolMetadata>) -> Vec<Value> {
@@ -359,8 +401,7 @@ fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{Tool, ToolOutput};
-    use async_trait::async_trait;
+    use crate::provider::test_support::{WeatherToolStub, test_tool_context};
     use axum::{
         Json, Router,
         body::Body,
@@ -411,47 +452,6 @@ mod tests {
         (format!("http://{addr}/v1"), state)
     }
 
-    struct WeatherToolStub;
-
-    #[async_trait]
-    impl Tool for WeatherToolStub {
-        fn metadata(&self) -> ToolMetadata {
-            ToolMetadata {
-                name: "get_weather".to_owned(),
-                description: "get weather".to_owned(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "city": {"type": "string"}
-                    },
-                    "required": ["city"],
-                    "additionalProperties": false
-                }),
-            }
-        }
-
-        async fn execute(
-            &self,
-            _context: ToolContext,
-            arguments: Value,
-        ) -> Result<ToolOutput, LlmError> {
-            Ok(ToolOutput::json(json!({
-                "ok": true,
-                "city": arguments["city"],
-                "weather": "小雨"
-            })))
-        }
-    }
-
-    fn test_context() -> ToolContext {
-        ToolContext {
-            task_id: "task-1".to_owned(),
-            user_id: Some("u1".to_owned()),
-            scope_id: "private:u1".to_owned(),
-            tool_call_id: None,
-        }
-    }
-
     #[tokio::test]
     async fn tool_loop_executes_function_call_and_returns_output_to_model() {
         let (base_url, state) = spawn_mock_tool_loop(vec![
@@ -485,7 +485,9 @@ mod tests {
         .await;
         let client =
             ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
-        let tools = ToolRegistry::new().register(WeatherToolStub).unwrap();
+        let tools = ToolRegistry::new()
+            .register(WeatherToolStub::new("小雨"))
+            .unwrap();
 
         let outcome = chat_completions_tool_loop(ChatCompletionsToolLoopRequest {
             client: &client,
@@ -494,7 +496,7 @@ mod tests {
             max_output_tokens: 1200,
             messages: &[ChatMessage::user("杭州天气怎么样")],
             tools,
-            tool_context: test_context(),
+            tool_context: test_tool_context(),
             max_rounds: 2,
         })
         .await
@@ -552,7 +554,9 @@ mod tests {
         .await;
         let client =
             ChatCompletionsClient::new("test-key", Some(&base_url), reqwest::Client::new());
-        let tools = ToolRegistry::new().register(WeatherToolStub).unwrap();
+        let tools = ToolRegistry::new()
+            .register(WeatherToolStub::new("小雨"))
+            .unwrap();
 
         let err = chat_completions_tool_loop(ChatCompletionsToolLoopRequest {
             client: &client,
@@ -561,7 +565,7 @@ mod tests {
             max_output_tokens: 1200,
             messages: &[ChatMessage::user("杭州天气怎么样")],
             tools,
-            tool_context: test_context(),
+            tool_context: test_tool_context(),
             max_rounds: 1,
         })
         .await

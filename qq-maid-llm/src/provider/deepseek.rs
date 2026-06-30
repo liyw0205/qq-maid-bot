@@ -13,8 +13,9 @@ use crate::{
     provider::{
         ChatOutcome, LlmProvider, LlmStream, ToolCallingProtocol, ToolChatRequest,
         openai::{
-            ChatCompletionsClient, ChatCompletionsToolLoopRequest, chat_completions_stream,
-            chat_completions_tool_loop, chat_completions_with_stream_fallback,
+            ChatCompletionsClient, chat_completions_stream, chat_completions_with_stream_fallback,
+            provider_chat_completions_tool_calling_protocol,
+            provider_chat_with_chat_completions_tools,
         },
         outcome_to_stream,
         types::{ChatRequest, ModelId, ModelProvider},
@@ -107,24 +108,23 @@ impl LlmProvider for DeepSeekProvider {
         {
             return self.chat(req.chat).await;
         }
-        let effective_model = effective_deepseek_model(req.chat.model.as_deref(), &self.model)?;
-        chat_completions_tool_loop(ChatCompletionsToolLoopRequest {
-            client: &self.client,
-            provider: self.name(),
-            model: &effective_model,
-            max_output_tokens: self.max_output_tokens,
-            messages: &req.chat.messages,
-            tools: req.tools,
-            tool_context: req.tool_context,
-            max_rounds: req.max_rounds,
-        })
+        provider_chat_with_chat_completions_tools(
+            &self.client,
+            self.name(),
+            &self.model,
+            self.max_output_tokens,
+            req,
+            effective_deepseek_model,
+        )
         .await
     }
 
     fn tool_calling_protocol(&self, model: Option<&str>) -> Option<ToolCallingProtocol> {
-        effective_deepseek_model(model, &self.model)
-            .ok()
-            .map(|_| ToolCallingProtocol::ChatCompletionsToolCalls)
+        provider_chat_completions_tool_calling_protocol(
+            model,
+            &self.model,
+            effective_deepseek_model,
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -173,8 +173,10 @@ fn effective_deepseek_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{Tool, ToolContext, ToolMetadata, ToolOutput, ToolRegistry};
-    use async_trait::async_trait;
+    use crate::{
+        provider::test_support::{WeatherToolStub, test_tool_context},
+        tool::ToolRegistry,
+    };
     use axum::{
         Router,
         body::Body,
@@ -224,47 +226,6 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}"), state)
-    }
-
-    struct WeatherToolStub;
-
-    #[async_trait]
-    impl Tool for WeatherToolStub {
-        fn metadata(&self) -> ToolMetadata {
-            ToolMetadata {
-                name: "get_weather".to_owned(),
-                description: "get weather".to_owned(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "city": {"type": "string"}
-                    },
-                    "required": ["city"],
-                    "additionalProperties": false
-                }),
-            }
-        }
-
-        async fn execute(
-            &self,
-            _context: ToolContext,
-            arguments: Value,
-        ) -> Result<ToolOutput, LlmError> {
-            Ok(ToolOutput::json(json!({
-                "ok": true,
-                "city": arguments["city"],
-                "weather": "阵雨"
-            })))
-        }
-    }
-
-    fn test_context() -> ToolContext {
-        ToolContext {
-            task_id: "task-1".to_owned(),
-            user_id: Some("u1".to_owned()),
-            scope_id: "private:u1".to_owned(),
-            tool_call_id: None,
-        }
     }
 
     #[test]
@@ -404,7 +365,9 @@ mod tests {
             stream: true,
             max_output_tokens: 1200,
         };
-        let tools = ToolRegistry::new().register(WeatherToolStub).unwrap();
+        let tools = ToolRegistry::new()
+            .register(WeatherToolStub::new("阵雨"))
+            .unwrap();
 
         let outcome = provider
             .chat_with_tools(ToolChatRequest {
@@ -415,7 +378,7 @@ mod tests {
                     metadata: Default::default(),
                 },
                 tools,
-                tool_context: test_context(),
+                tool_context: test_tool_context(),
                 max_rounds: 2,
             })
             .await

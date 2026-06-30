@@ -31,7 +31,9 @@ use crate::{
 pub(crate) use chat::{
     ChatCompletionsClient, chat_completions_stream, chat_completions_with_stream_fallback,
 };
-pub(crate) use chat_tool_loop::{ChatCompletionsToolLoopRequest, chat_completions_tool_loop};
+pub(crate) use chat_tool_loop::{
+    provider_chat_completions_tool_calling_protocol, provider_chat_with_chat_completions_tools,
+};
 
 struct OpenAiChatFallbackRequest<'a> {
     api_mode: OpenAiApiMode,

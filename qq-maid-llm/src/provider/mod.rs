@@ -8,6 +8,8 @@ pub mod deepseek;
 pub mod limiter;
 pub mod openai;
 pub mod status;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod types;
 
 use std::{pin::Pin, sync::Arc};
