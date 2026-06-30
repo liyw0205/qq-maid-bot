@@ -13,6 +13,8 @@ use crate::error::LlmError;
 
 /// Tool 执行结果最大字符数，避免把上游大响应直接灌回模型上下文。
 pub const DEFAULT_TOOL_OUTPUT_MAX_CHARS: usize = 4000;
+/// 合法生产配置的最小 Tool 输出字符数，至少能表达 `{"truncated":true}`。
+pub const MIN_TOOL_OUTPUT_MAX_CHARS: usize = r#"{"truncated":true}"#.len();
 /// 单个 Tool 默认超时时间。
 pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -308,12 +310,17 @@ fn truncate_tool_output(serialized: &str, max_chars: usize) -> String {
         }
     }
     best.unwrap_or_else(|| {
-        // 极端情况下限制小到连 truncated 标记都装不下；生产配置会拒绝 0，
-        // 非 0 限制下仍返回不超过上限的最小合法 JSON。
-        match max_chars {
-            0 => String::new(),
-            1 => "0".to_owned(),
-            _ => "{}".to_owned(),
+        // 合法生产配置不会低于 MIN_TOOL_OUTPUT_MAX_CHARS，正常应至少返回
+        // {"truncated":true}。下面只兜住内部测试或未来误用 ToolRegistry::with_limits
+        // 传入极小值的场景，避免 panic 或残缺 JSON。
+        if max_chars >= MIN_TOOL_OUTPUT_MAX_CHARS {
+            r#"{"truncated":true}"#.to_owned()
+        } else {
+            match max_chars {
+                0 => String::new(),
+                1 => "0".to_owned(),
+                _ => "{}".to_owned(),
+            }
         }
     })
 }
@@ -472,5 +479,22 @@ mod tests {
 
         assert!(output.chars().count() <= 2);
         serde_json::from_str::<Value>(&output).expect("tiny output must remain valid JSON");
+    }
+
+    #[tokio::test]
+    async fn registry_minimum_tool_output_limit_keeps_truncated_marker() {
+        let registry = ToolRegistry::new()
+            .with_limits(DEFAULT_TOOL_TIMEOUT, MIN_TOOL_OUTPUT_MAX_CHARS)
+            .register(BigTool)
+            .unwrap();
+
+        let output = registry
+            .execute_json(&test_context(), "big", "{}")
+            .await
+            .unwrap();
+
+        assert!(output.chars().count() <= MIN_TOOL_OUTPUT_MAX_CHARS);
+        let parsed: Value = serde_json::from_str(&output).expect("output must be valid JSON");
+        assert_eq!(parsed["truncated"], Value::Bool(true));
     }
 }

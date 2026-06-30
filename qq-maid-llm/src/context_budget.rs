@@ -307,11 +307,27 @@ pub fn context_budget_exceeded(report: &BudgetReport, stage: &'static str) -> Ll
     )
 }
 
-/// 估算 JSON 序列化后的字符数；序列化失败时保守使用 0 并交由调用点原错误处理。
-pub fn estimated_json_chars<T: Serialize>(value: &T) -> usize {
-    serde_json::to_string(value)
-        .map(|text| text.chars().count())
-        .unwrap_or(0)
+/// 估算 JSON 序列化后的字符数；失败时必须显式返回错误，不能按 0 字符放行请求。
+pub fn estimated_json_chars<T: Serialize>(
+    value: &T,
+    stage: &'static str,
+) -> Result<usize, LlmError> {
+    let text = serde_json::to_string(value).map_err(|err| {
+        LlmError::new(
+            "context_budget_estimate_error",
+            format!("failed to estimate JSON chars for context budget: {err}"),
+            stage,
+        )
+    })?;
+    #[cfg(test)]
+    if text.contains("__force_json_estimate_error__") {
+        return Err(LlmError::new(
+            "context_budget_estimate_error",
+            "failed to estimate JSON chars for context budget: forced test error",
+            stage,
+        ));
+    }
+    Ok(text.chars().count())
 }
 
 pub fn log_budget_report(scope: &'static str, report: &BudgetReport) {
@@ -346,6 +362,7 @@ pub fn log_budget_report(scope: &'static str, report: &BudgetReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serializer;
 
     fn config(limit: usize) -> ContextBudgetConfig {
         ContextBudgetConfig {
@@ -398,5 +415,25 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.code, "config");
+    }
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(serde::ser::Error::custom("serialize failed"))
+        }
+    }
+
+    #[test]
+    fn estimated_json_chars_returns_error_on_serialize_failure() {
+        let err = estimated_json_chars(&FailingSerialize, "context_budget").unwrap_err();
+
+        assert_eq!(err.code, "context_budget_estimate_error");
+        assert_eq!(err.stage, "context_budget");
+        assert!(err.message.contains("failed to estimate JSON chars"));
     }
 }
