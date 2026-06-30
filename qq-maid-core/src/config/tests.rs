@@ -228,6 +228,37 @@ fn max_concurrent_responses_allows_zero_and_rejects_large_values() {
 }
 
 #[test]
+fn context_budget_config_rejects_reserve_not_smaller_than_window() {
+    let previous_limit = env::var("AGENT_CONTEXT_CHAR_LIMIT").ok();
+    let previous_reserve = env::var("AGENT_CONTEXT_OUTPUT_RESERVE_CHARS").ok();
+    let previous_turns = env::var("AGENT_CONTEXT_PROTECTED_RECENT_TURNS").ok();
+    unsafe {
+        env::set_var("AGENT_CONTEXT_CHAR_LIMIT", "100");
+        env::set_var("AGENT_CONTEXT_OUTPUT_RESERVE_CHARS", "100");
+        env::set_var("AGENT_CONTEXT_PROTECTED_RECENT_TURNS", "0");
+    }
+
+    let err = context_budget_from_env().unwrap_err();
+
+    assert_eq!(err.code, "config");
+    assert!(err.message.contains("OUTPUT_RESERVE"));
+
+    restore_env("AGENT_CONTEXT_CHAR_LIMIT", previous_limit);
+    restore_env("AGENT_CONTEXT_OUTPUT_RESERVE_CHARS", previous_reserve);
+    restore_env("AGENT_CONTEXT_PROTECTED_RECENT_TURNS", previous_turns);
+}
+
+fn restore_env(name: &str, value: Option<String>) {
+    unsafe {
+        if let Some(value) = value {
+            env::set_var(name, value);
+        } else {
+            env::remove_var(name);
+        }
+    }
+}
+
+#[test]
 fn tool_calling_defaults_are_enabled_and_bounded() {
     unsafe {
         env::remove_var("QQ_MAID_TEST_TOOL_CALLING_ENABLED");

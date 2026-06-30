@@ -224,6 +224,64 @@ fn chat_messages_keep_stable_system_prefix_before_time_context() {
 }
 
 #[test]
+fn budgeted_chat_messages_evict_old_history_before_recent_turns() {
+    let long_text = "很长的上下文".repeat(80);
+    let req = RespondRequest {
+        purpose: RespondPurpose::Chat,
+        user_text: "当前问题".to_owned(),
+        system_prompts: vec!["固定 prompt".to_owned()],
+        knowledge_context: format!("知识片段 {long_text}"),
+        memory_context: "长期记忆：保留这个偏好".to_owned(),
+        session_context: format!("会话摘要 {long_text}"),
+        history_messages: vec![
+            ChatMessage::user(format!("旧用户 {long_text}")),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: format!("旧助手 {long_text}"),
+            },
+            ChatMessage::user("最近用户".to_owned()),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "最近助手".to_owned(),
+            },
+        ],
+        ..Default::default()
+    };
+
+    let messages = budget_chat_messages(
+        &req,
+        ContextBudgetConfig {
+            context_window_chars: 600,
+            output_reserve_chars: 50,
+            protected_recent_turns: 1,
+        },
+    )
+    .unwrap();
+    let contents = messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(contents.iter().any(|content| content == &"固定 prompt"));
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("当前本地日期"))
+    );
+    assert!(
+        contents
+            .iter()
+            .any(|content| content == &"长期记忆：保留这个偏好")
+    );
+    assert!(contents.iter().any(|content| content == &"最近用户"));
+    assert!(contents.iter().any(|content| content == &"最近助手"));
+    assert!(contents.iter().any(|content| content == &"当前问题"));
+    assert!(!contents.iter().any(|content| content.contains("旧用户")));
+    assert!(!contents.iter().any(|content| content.contains("知识片段")));
+    assert!(!contents.iter().any(|content| content.contains("会话摘要")));
+}
+
+#[test]
 fn llm_time_context_prompt_is_built_in_llm_layer() {
     let offset = crate::util::time_context::shanghai_offset();
     let ctx =
