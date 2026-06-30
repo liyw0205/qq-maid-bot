@@ -579,7 +579,7 @@ fn budget_chat_messages(
                 &mut items,
                 BudgetItemKind::Required,
                 ChatMessage::system(prompt),
-            );
+            )?;
         }
     }
     // 时间上下文是当前请求语义的一部分，不能被旧历史或检索内容挤掉。
@@ -587,27 +587,27 @@ fn budget_chat_messages(
         &mut items,
         BudgetItemKind::Required,
         ChatMessage::system(llm_time_context_prompt(&request_time_context())),
-    );
+    )?;
     if !req.knowledge_context.trim().is_empty() {
         push_message_item(
             &mut items,
             BudgetItemKind::Knowledge,
             ChatMessage::system(req.knowledge_context.clone()),
-        );
+        )?;
     }
     if !req.memory_context.trim().is_empty() {
         push_message_item(
             &mut items,
             BudgetItemKind::Memory,
             ChatMessage::system(req.memory_context.clone()),
-        );
+        )?;
     }
     if !req.session_context.trim().is_empty() {
         push_message_item(
             &mut items,
             BudgetItemKind::Session,
             ChatMessage::system(req.session_context.clone()),
-        );
+        )?;
     }
 
     let history = req
@@ -627,13 +627,13 @@ fn budget_chat_messages(
                 BudgetItemKind::OldHistory
             },
             messages,
-        );
+        )?;
     }
     push_message_item(
         &mut items,
         BudgetItemKind::Required,
         ChatMessage::user(req.user_text.clone()),
-    );
+    )?;
 
     let budgeted = apply_context_budget(items, config)?;
     log_budget_report("initial_chat_context", &budgeted.report);
@@ -644,17 +644,18 @@ fn push_message_item(
     items: &mut Vec<BudgetItem<Vec<ChatMessage>>>,
     kind: BudgetItemKind,
     message: ChatMessage,
-) {
-    push_messages_item(items, kind, vec![message]);
+) -> Result<(), LlmError> {
+    push_messages_item(items, kind, vec![message])
 }
 
 fn push_messages_item(
     items: &mut Vec<BudgetItem<Vec<ChatMessage>>>,
     kind: BudgetItemKind,
     messages: Vec<ChatMessage>,
-) {
-    let estimated_chars = estimated_json_chars(&messages);
+) -> Result<(), LlmError> {
+    let estimated_chars = estimated_json_chars(&messages, "context_budget")?;
     items.push(BudgetItem::new(kind, messages, estimated_chars));
+    Ok(())
 }
 
 fn partition_history_for_budget(

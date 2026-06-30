@@ -24,59 +24,6 @@ impl EnvSnapshot {
     }
 }
 
-const APP_CONFIG_ENV_KEYS: &[&str] = &[
-    "LLM_PROVIDER",
-    "LLM_MODEL",
-    "OPENAI_MODEL",
-    "OPENAI_SEARCH_MODEL",
-    "TITLE_MODEL",
-    "TODO_MODEL",
-    "MEMORY_MODEL",
-    "COMPACT_MODEL",
-    "TRANSLATION_MODEL",
-    "QWEATHER_API_KEY",
-    "QWEATHER_API_HOST",
-    "QWEATHER_GEO_HOST",
-    "PROMPT_DIR",
-    "OPENAI_BASE_URL",
-    "OPENAI_BASE_URLS",
-    "OPENAI_API_MODE",
-    "DEEPSEEK_MODEL",
-    "DEEPSEEK_BASE_URL",
-    "BIGMODEL_MODEL",
-    "BIGMODEL_BASE_URL",
-    "LLM_STREAM",
-    "LLM_REQUEST_TIMEOUT_SECONDS",
-    "LLM_TTFT_WARN_SECONDS",
-    "LLM_MAX_OUTPUT_TOKENS",
-    "MAX_CONCURRENT_RESPONSES",
-    "TOOL_CALLING_ENABLED",
-    "TOOL_CALLING_MAX_ROUNDS",
-    "AGENT_CONTEXT_CHAR_LIMIT",
-    "AGENT_CONTEXT_OUTPUT_RESERVE_CHARS",
-    "AGENT_CONTEXT_PROTECTED_RECENT_TURNS",
-    "AGENT_TOOL_RESULT_CHAR_LIMIT",
-    "LLM_SERVER_HOST",
-    "LLM_SERVER_PORT",
-    "APP_DB_FILE",
-    "RSS_ENABLED",
-    "RSS_POLL_INTERVAL_SECONDS",
-    "RSS_HTTP_TIMEOUT_SECONDS",
-    "RSS_MAX_BODY_BYTES",
-    "RSS_MAX_PUSH_PER_FEED",
-    "RSS_SUMMARY_MAX_CHARS",
-    "RSS_SEEN_RETENTION",
-    "RSS_PUSH_MAX_FAILURES",
-    "RSS_PUSH_MESSAGE_TYPE",
-    "TODO_DAILY_REMINDER_ENABLED",
-    "TODO_DAILY_REMINDER_TIME",
-    "RSS_ALLOW_PRIVATE_URLS",
-    "KNOWLEDGE_DIR",
-    "MEMBER_ID_MAPPING_FILE",
-    "WEB_CONSOLE_ENABLED",
-    "WEB_CONSOLE_ALLOWED_ORIGINS",
-];
-
 #[test]
 fn parse_provider_accepts_known_values() {
     assert_eq!(parse_provider("openai").unwrap(), ProviderMode::OpenAi);
@@ -305,29 +252,27 @@ fn max_concurrent_responses_allows_zero_and_rejects_large_values() {
 }
 
 #[test]
-fn app_config_from_env_uses_default_context_budget_config() {
+fn context_budget_config_uses_default_values() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let snapshot = EnvSnapshot::capture(APP_CONFIG_ENV_KEYS);
-    for name in APP_CONFIG_ENV_KEYS {
+    let names = [
+        "AGENT_CONTEXT_CHAR_LIMIT",
+        "AGENT_CONTEXT_OUTPUT_RESERVE_CHARS",
+        "AGENT_CONTEXT_PROTECTED_RECENT_TURNS",
+    ];
+    let snapshot = EnvSnapshot::capture(&names);
+    for name in names {
         restore_env(name, None);
     }
-    unsafe {
-        env::set_var("QWEATHER_API_KEY", "test-qweather-key");
-    }
 
-    let config = AppConfig::from_env().unwrap();
+    let config = context_budget_from_env().unwrap();
 
     assert_eq!(
-        config.context_budget,
+        config,
         ContextBudgetConfig {
             context_window_chars: DEFAULT_AGENT_CONTEXT_CHAR_LIMIT as usize,
             output_reserve_chars: DEFAULT_AGENT_CONTEXT_OUTPUT_RESERVE_CHARS as usize,
             protected_recent_turns: DEFAULT_AGENT_CONTEXT_PROTECTED_RECENT_TURNS as usize,
         }
-    );
-    assert_eq!(
-        config.tool_result_max_chars,
-        DEFAULT_AGENT_TOOL_RESULT_CHAR_LIMIT as usize
     );
 
     snapshot.restore();
@@ -419,25 +364,66 @@ fn context_budget_config_allows_zero_protected_recent_turns() {
 #[test]
 fn tool_result_char_limit_is_not_context_budget_config() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let snapshot = EnvSnapshot::capture(APP_CONFIG_ENV_KEYS);
-    for name in APP_CONFIG_ENV_KEYS {
+    let names = [
+        "AGENT_CONTEXT_CHAR_LIMIT",
+        "AGENT_CONTEXT_OUTPUT_RESERVE_CHARS",
+        "AGENT_CONTEXT_PROTECTED_RECENT_TURNS",
+        "AGENT_TOOL_RESULT_CHAR_LIMIT",
+    ];
+    let snapshot = EnvSnapshot::capture(&names);
+    for name in names {
         restore_env(name, None);
     }
     unsafe {
-        env::set_var("QWEATHER_API_KEY", "test-qweather-key");
         env::set_var("AGENT_TOOL_RESULT_CHAR_LIMIT", "1234");
     }
 
-    let config = AppConfig::from_env().unwrap();
+    let context_budget = context_budget_from_env().unwrap();
+    let tool_result_max_chars = env_u64_bounded_range(
+        "AGENT_TOOL_RESULT_CHAR_LIMIT",
+        DEFAULT_AGENT_TOOL_RESULT_CHAR_LIMIT,
+        MIN_AGENT_TOOL_RESULT_CHAR_LIMIT,
+        200_000,
+    )
+    .unwrap();
 
-    assert_eq!(config.tool_result_max_chars, 1234);
+    assert_eq!(tool_result_max_chars, 1234);
     assert_eq!(
-        config.context_budget,
+        context_budget,
         ContextBudgetConfig {
             context_window_chars: DEFAULT_AGENT_CONTEXT_CHAR_LIMIT as usize,
             output_reserve_chars: DEFAULT_AGENT_CONTEXT_OUTPUT_RESERVE_CHARS as usize,
             protected_recent_turns: DEFAULT_AGENT_CONTEXT_PROTECTED_RECENT_TURNS as usize,
         }
+    );
+
+    snapshot.restore();
+}
+
+#[test]
+fn tool_result_char_limit_rejects_values_below_minimum() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let snapshot = EnvSnapshot::capture(&["AGENT_TOOL_RESULT_CHAR_LIMIT"]);
+    unsafe {
+        env::set_var(
+            "AGENT_TOOL_RESULT_CHAR_LIMIT",
+            (MIN_AGENT_TOOL_RESULT_CHAR_LIMIT - 1).to_string(),
+        );
+    }
+
+    let err = env_u64_bounded_range(
+        "AGENT_TOOL_RESULT_CHAR_LIMIT",
+        DEFAULT_AGENT_TOOL_RESULT_CHAR_LIMIT,
+        MIN_AGENT_TOOL_RESULT_CHAR_LIMIT,
+        200_000,
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code, "config");
+    assert!(err.message.contains("AGENT_TOOL_RESULT_CHAR_LIMIT"));
+    assert!(
+        err.message
+            .contains(&MIN_AGENT_TOOL_RESULT_CHAR_LIMIT.to_string())
     );
 
     snapshot.restore();
