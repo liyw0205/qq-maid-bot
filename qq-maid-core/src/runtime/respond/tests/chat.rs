@@ -329,16 +329,10 @@ async fn restore_then_cancel_last_reference_creates_pending_without_relisting() 
         .respond(private_message("看看已完成"))
         .await
         .unwrap();
-    let tool_request = inspector.tool_requests().remove(0);
-    tool_request
-        .tools
-        .execute_json(
-            &tool_request.tool_context,
-            "list_todos",
-            r#"{"status":"completed"}"#,
-        )
-        .await
-        .unwrap();
+    assert_eq!(inspector.tool_call_count(), 0);
+    let _ = service.respond(private_message("恢复第 1 个")).await;
+    let mut tool_requests = inspector.tool_requests();
+    let tool_request = tool_requests.pop().unwrap();
     tool_request
         .tools
         .execute_json(
@@ -402,16 +396,10 @@ async fn restore_then_reuse_stale_number_keeps_visible_number_error() {
         .respond(private_message("看看已完成"))
         .await
         .unwrap();
-    let tool_request = inspector.tool_requests().remove(0);
-    tool_request
-        .tools
-        .execute_json(
-            &tool_request.tool_context,
-            "list_todos",
-            r#"{"status":"completed"}"#,
-        )
-        .await
-        .unwrap();
+    assert_eq!(inspector.tool_call_count(), 0);
+    let _ = service.respond(private_message("恢复第 1 个")).await;
+    let mut tool_requests = inspector.tool_requests();
+    let tool_request = tool_requests.pop().unwrap();
     tool_request
         .tools
         .execute_json(

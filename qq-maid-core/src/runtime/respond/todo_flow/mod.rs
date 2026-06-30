@@ -62,8 +62,10 @@ const TODO_QUERY_LIST_VERBS: &[&str] = &[
 ];
 const TODO_QUERY_ALL_MARKERS: &[&str] = &["全部", "所有", "包含已完成", "包含已取消"];
 const TODO_QUERY_PENDING_EXACT: &[&str] = &["我的待办", "待办列表"];
-const TODO_QUERY_COMPLETED_EXACT: &[&str] = &["已完成的待办"];
-const TODO_QUERY_CANCELLED_EXACT: &[&str] = &["已取消的待办"];
+const TODO_QUERY_COMPLETED_EXACT: &[&str] =
+    &["已完成的待办", "看看已完成", "查看已完成", "列出已完成"];
+const TODO_QUERY_CANCELLED_EXACT: &[&str] =
+    &["已取消的待办", "看看已取消", "查看已取消", "列出已取消"];
 
 impl RustRespondService {
     /// 处理待办指令的主入口。解析 `/todo` 子命令并分派到对应的处理逻辑。

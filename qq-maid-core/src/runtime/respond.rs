@@ -277,14 +277,16 @@ impl RustRespondService {
             return Ok(RespondPlan::Immediate);
         }
 
-        let tool_route = self.route_tool_loop(req, active_session.as_ref());
-        if matches!(tool_route, ToolLoopRoute::CompleteToolLoop) {
-            return Ok(RespondPlan::CompleteToolLoop);
-        }
-
+        // 先保护已有确定性命令和自然语言 Todo 查询，避免简单列表查询绕过
+        // `handle_todo_flow()` 进入模型 Tool Loop，回归同义词和默认过滤语义。
         let classification = classify_inbound_with_active(&user_text, active_session.as_ref());
         if matches!(classification.kind, CoreInboundKind::Immediate) {
-            Ok(RespondPlan::Immediate)
+            return Ok(RespondPlan::Immediate);
+        }
+
+        let tool_route = self.route_tool_loop(req, active_session.as_ref());
+        if matches!(tool_route, ToolLoopRoute::CompleteToolLoop) {
+            Ok(RespondPlan::CompleteToolLoop)
         } else {
             Ok(RespondPlan::StreamingChat)
         }

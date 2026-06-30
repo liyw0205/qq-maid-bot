@@ -661,8 +661,8 @@ mod tests {
             prompt::PromptConfig,
             query::{QueryExecutor, QueryOutcome, QueryRequest},
             rss::{RssFetchConfig, RssFetcher, RssStore},
-            session::{SessionMeta, SessionStore},
-            todo::{TodoItemDraft, TodoStore, TodoTimePrecision},
+            session::{LastTodoAction, SessionMeta, SessionStore},
+            todo::{TodoItemDraft, TodoStatus, TodoStore, TodoTimePrecision},
             train::{TrainExecutor, TrainSchedule, TrainScheduleRequest},
             weather::{WeatherExecutor, WeatherOutcome, WeatherRequest},
         },
@@ -782,7 +782,24 @@ mod tests {
     }
 
     #[test]
-    fn core_plan_routes_todo_query_and_followup_to_complete_tool_loop() {
+    fn core_plan_routes_simple_todo_queries_to_immediate() {
+        let provider = TestProvider::replying("工具回复")
+            .with_tool_protocol(ToolCallingProtocol::OpenAiResponses);
+        let state = test_state_with_tool_calling(provider, 5, true);
+        let service = CoreHandle::new(state).respond_service();
+
+        for input in ["看一下待办", "看一下代办", "看看已完成"] {
+            let req: RespondRequest = private_request(input).into();
+            assert_eq!(
+                service.plan_core_respond(&req).unwrap(),
+                RespondPlan::Immediate,
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_plan_routes_todo_mutations_and_followups_to_complete_tool_loop() {
         let provider = TestProvider::replying("工具回复")
             .with_tool_protocol(ToolCallingProtocol::OpenAiResponses);
         let state = test_state_with_tool_calling(provider, 5, true);
@@ -803,10 +820,23 @@ mod tests {
             result_ids: vec!["todo-1".to_owned()],
             created_at: "2026-06-30T00:00:00+08:00".to_owned(),
         });
+        session.last_todo_action = Some(LastTodoAction {
+            owner_key: "private:u1".to_owned(),
+            item_id: "todo-1".to_owned(),
+            title: "检查日志".to_owned(),
+            action: "completed".to_owned(),
+            resulting_status: TodoStatus::Completed,
+            created_at: "2026-06-30T00:00:00+08:00".to_owned(),
+        });
         session_store.save(&mut session).unwrap();
 
         let service = CoreHandle::new(state).respond_service();
-        for input in ["看看已完成", "恢复第 1 个"] {
+        for input in [
+            "提醒我明天下午三点开会",
+            "完成第一条",
+            "恢复第 1 个",
+            "取消它",
+        ] {
             let req: RespondRequest = private_request(input).into();
             assert_eq!(
                 service.plan_core_respond(&req).unwrap(),
@@ -1004,22 +1034,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_private_todo_query_uses_complete_tool_loop_path() {
-        let provider = TestProvider::replying("待办工具回复")
+    async fn core_private_simple_todo_queries_use_deterministic_path() {
+        let provider = TestProvider::replying("不应调用模型")
             .with_tool_protocol(ToolCallingProtocol::OpenAiResponses);
         let state = test_state_with_tool_calling(provider.clone(), 5, true);
+        let owner = TodoStore::owner(Some("u1"), "private:u1");
+        let todo_store = state.todo_store.clone();
+        todo_store
+            .create(
+                &owner,
+                TodoItemDraft {
+                    title: "待查看项目".to_owned(),
+                    detail: None,
+                    raw_text: None,
+                    due_date: None,
+                    due_at: None,
+                    time_precision: TodoTimePrecision::None,
+                },
+            )
+            .unwrap();
         let service = CoreHandle::new(state);
 
-        let output = service
-            .respond(private_request("看看已完成"))
-            .await
-            .unwrap();
+        let mut responses = Vec::new();
+        for input in ["看一下待办", "看一下代办"] {
+            let output = service.respond(private_request(input)).await.unwrap();
+            let CoreRespondOutput::Complete(response) = output else {
+                panic!("expected complete output for deterministic todo query");
+            };
+            assert_eq!(response.command.as_deref(), Some("todo_list"), "{input}");
+            assert!(response.text.as_deref().unwrap().contains("待查看项目"));
+            responses.push(response.text);
+        }
 
-        let CoreRespondOutput::Complete(response) = output else {
-            panic!("expected complete output for todo tool loop path");
-        };
-        assert_eq!(response.text.as_deref(), Some("待办工具回复"));
-        assert_eq!(provider.tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(responses[0], responses[1]);
+        assert_eq!(provider.tool_calls.load(Ordering::SeqCst), 0);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
 

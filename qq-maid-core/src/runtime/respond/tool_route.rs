@@ -6,7 +6,7 @@
 
 use crate::runtime::session::SessionRecord;
 
-use super::{RespondRequest, chat_flow::todo_guard, todo_flow};
+use super::{RespondRequest, chat_flow::todo_guard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ToolLoopRoute {
@@ -98,8 +98,9 @@ fn looks_like_weather_meta_discussion(text: &str) -> bool {
 
 /// 判断普通私聊是否明显需要 Todo Tool。
 ///
-/// 写操作复用 `todo_guard` 的严格判定；查询类只覆盖当前 Tool Loop 已承载的
-/// 可见编号/最近对象绑定场景，避免“聊聊待办设计”误入工具链路。
+/// 这里只覆盖创建、修改、完成、取消、恢复、删除等写操作，以及依赖最近
+/// Todo 查询/操作上下文的续指。普通列表查询必须继续交给 `handle_todo_flow()`
+/// 的确定性流程，避免同义词和默认过滤语义回归。
 fn looks_like_todo_tool_request(text: &str, ctx: ToolRouteContext<'_>) -> bool {
     let has_last_query = ctx
         .active_session
@@ -109,28 +110,7 @@ fn looks_like_todo_tool_request(text: &str, ctx: ToolRouteContext<'_>) -> bool {
         .active_session
         .and_then(|session| session.last_todo_action.as_ref())
         .is_some();
-    if todo_guard::requires_todo_tool_with_context(text, has_last_query, has_last_action) {
-        return true;
-    }
-    if todo_flow::is_natural_todo_query_text(text) {
-        return true;
-    }
-    contains_any(
-        text,
-        &[
-            "看看已完成",
-            "查看已完成",
-            "列出已完成",
-            "看看已取消",
-            "查看已取消",
-            "列出已取消",
-            "看看待办",
-            "查看待办",
-            "列出待办",
-            "还有什么待办",
-            "有哪些待办",
-        ],
-    )
+    todo_guard::requires_todo_tool_with_context(text, has_last_query, has_last_action)
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -227,16 +207,34 @@ mod tests {
         for (text, session) in [
             ("提醒我明天下午三点开会", None),
             ("完成第 1 个待办", None),
+            ("完成第一条", Some(&with_query)),
             ("修改第 2 个待办", None),
             ("取消第 2 个任务", None),
             ("永久删除已完成待办第 3 个", None),
             ("恢复第 1 个", Some(&with_query)),
             ("取消它", Some(&with_action)),
-            ("看看已完成", None),
         ] {
             assert_eq!(
                 route_tool_loop(&request(text), context(session)),
                 ToolLoopRoute::CompleteToolLoop,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn todo_list_queries_keep_plain_route_for_deterministic_flow() {
+        for text in [
+            "看看已完成",
+            "看看待办",
+            "查看待办",
+            "列出待办",
+            "还有什么待办",
+            "有哪些待办",
+        ] {
+            assert_eq!(
+                route_tool_loop(&request(text), context(None)),
+                ToolLoopRoute::PlainChat,
                 "{text}"
             );
         }
