@@ -91,7 +91,10 @@ fn reply_claims_todo_write_success(reply: &str) -> bool {
         return false;
     }
     let normalized: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
-    let success_markers = [
+    if looks_like_todo_status_or_capability_explanation(&normalized) {
+        return false;
+    }
+    let action_markers = [
         "已新增",
         "已新建",
         "已创建",
@@ -119,7 +122,7 @@ fn reply_claims_todo_write_success(reply: &str) -> bool {
     ];
     // 不读取用户输入、不推断“本轮必须调用哪个工具”；这里只从模型最终回复
     // 本身识别高风险成功文案，避免无 Tool 结果时透传“已新增/已删除”。
-    if success_markers
+    if action_markers
         .iter()
         .any(|marker| normalized.starts_with(marker))
     {
@@ -150,7 +153,7 @@ fn reply_claims_todo_write_success(reply: &str) -> bool {
     if !has_todo_context {
         return false;
     }
-    contains_any(&normalized, &success_markers)
+    contains_any(&normalized, &action_markers)
 }
 
 fn looks_like_non_success_explanation(text: &str) -> bool {
@@ -164,10 +167,62 @@ fn looks_like_non_success_explanation(text: &str) -> bool {
             "不能确认",
             "没有收到",
             "没有调用",
+            "暂不支持",
+            "不支持",
+            "不能直接",
+            "无法直接",
+            "请先",
+            "请提供",
+            "需要先",
             "不能算",
             "不算",
         ],
     )
+}
+
+fn looks_like_todo_status_or_capability_explanation(text: &str) -> bool {
+    // “已完成待办 / 已取消待办”常用于列表状态、能力说明或规则解释，
+    // 不能等同于“我已经把某条待办完成/取消”。真正的动作成功文案仍会被
+    // 后续“待办 + 已完成/已删除”等组合拦截。
+    let starts_with_status = [
+        "已完成待办",
+        "已取消待办",
+        "已完成的待办",
+        "已取消的待办",
+        "已完成列表",
+        "已取消列表",
+    ]
+    .iter()
+    .any(|marker| text.starts_with(marker));
+    starts_with_status
+        && contains_any(
+            text,
+            &[
+                "可以删除",
+                "可以查看",
+                "可以查询",
+                "可以恢复",
+                "不能删除",
+                "不能直接删除",
+                "不支持删除",
+                "暂不支持",
+                "查看",
+                "查询",
+            ],
+        )
+        || contains_any(
+            text,
+            &[
+                "可以删除已完成待办",
+                "可以删除已完成的待办",
+                "可以查看已完成待办",
+                "可以查看已完成的待办",
+                "可以查询已完成待办",
+                "可以查询已完成的待办",
+                "支持删除已完成待办",
+                "支持删除已完成的待办",
+            ],
+        )
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -247,6 +302,24 @@ mod tests {
     }
 
     #[test]
+    fn capability_and_status_explanations_pass_without_tool_result() {
+        for reply in [
+            "可以删除已完成待办，但需要先列出并选择具体条目。",
+            "暂不支持批量清理全部已完成待办；可以先查看已完成列表。",
+            "请提供要删除的已完成待办编号；我还不能确认已经删除任何待办。",
+            "已完成待办可以查看，也可以选择具体条目删除。",
+        ] {
+            assert_eq!(
+                validate_todo_success_reply(&output(reply, Vec::new())),
+                TodoSuccessValidation::Passed {
+                    claimed_success: false
+                },
+                "{reply}"
+            );
+        }
+    }
+
+    #[test]
     fn todo_success_reply_without_tool_result_is_blocked() {
         assert_eq!(
             validate_todo_success_reply(&output("已新增待办：明天接老公", Vec::new())),
@@ -258,6 +331,14 @@ mod tests {
         );
         assert_eq!(
             validate_todo_success_reply(&output("第二条待办已删除。", Vec::new())),
+            TodoSuccessValidation::Blocked
+        );
+        assert_eq!(
+            validate_todo_success_reply(&output("刚才那个待办已完成。", Vec::new())),
+            TodoSuccessValidation::Blocked
+        );
+        assert_eq!(
+            validate_todo_success_reply(&output("已删除待办，还要继续吗？", Vec::new())),
             TodoSuccessValidation::Blocked
         );
     }
