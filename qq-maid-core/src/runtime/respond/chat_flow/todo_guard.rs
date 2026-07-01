@@ -174,10 +174,8 @@ fn explicitly_denies_todo_success(text: &str) -> bool {
 fn looks_like_todo_status_or_capability_explanation(text: &str) -> bool {
     // “已完成待办 / 已取消待办”常用于列表状态、能力说明或规则解释，
     // 不能等同于“我已经把某条待办完成/取消”。真正的动作成功文案仍会被
-    // 后续“待办 + 已完成/已删除”等组合拦截。
-    if contains_clear_todo_write_success_marker(text) {
-        return false;
-    }
+    // 后续“待办 + 已完成/已删除”等组合拦截；但风险提示里的“已删除项目不可恢复”
+    // 不应反向覆盖前面的缺参 / 能力说明。
     let starts_with_status = [
         "已完成待办",
         "已取消待办",
@@ -188,8 +186,8 @@ fn looks_like_todo_status_or_capability_explanation(text: &str) -> bool {
     ]
     .iter()
     .any(|marker| text.starts_with(marker));
-    starts_with_status
-        && contains_any(
+    if starts_with_status
+        && allowlist_marker_without_action_success(
             text,
             &[
                 "可以删除",
@@ -204,29 +202,32 @@ fn looks_like_todo_status_or_capability_explanation(text: &str) -> bool {
                 "查询",
             ],
         )
-        || contains_any(
-            text,
-            &[
-                "请提供要删除的已完成待办",
-                "请提供要删除的已完成的待办",
-                "请先查看已完成列表",
-                "请先查询已完成列表",
-                "需要先列出",
-                "需要先查看",
-                "需要先查询",
-                "可以删除已完成待办",
-                "可以删除已完成的待办",
-                "可以查看已完成待办",
-                "可以查看已完成的待办",
-                "可以查询已完成待办",
-                "可以查询已完成的待办",
-                "当前不支持一句话批量清理全部已完成待办",
-                "暂不支持批量清理全部已完成待办",
-                "暂不支持一句话批量清理全部已完成待办",
-                "支持删除已完成待办",
-                "支持删除已完成的待办",
-            ],
-        )
+    {
+        return true;
+    }
+    allowlist_marker_without_action_success(
+        text,
+        &[
+            "请提供要删除的已完成待办",
+            "请提供要删除的已完成的待办",
+            "请先查看已完成列表",
+            "请先查询已完成列表",
+            "需要先列出",
+            "需要先查看",
+            "需要先查询",
+            "可以删除已完成待办",
+            "可以删除已完成的待办",
+            "可以查看已完成待办",
+            "可以查看已完成的待办",
+            "可以查询已完成待办",
+            "可以查询已完成的待办",
+            "当前不支持一句话批量清理全部已完成待办",
+            "暂不支持批量清理全部已完成待办",
+            "暂不支持一句话批量清理全部已完成待办",
+            "支持删除已完成待办",
+            "支持删除已完成的待办",
+        ],
+    )
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -243,32 +244,43 @@ fn starts_with_todo_success_marker(text: &str) -> bool {
         .any(|marker| text.starts_with(marker))
 }
 
-fn contains_clear_todo_write_success_marker(text: &str) -> bool {
-    contains_any(
-        text,
-        &[
-            "已新增",
-            "已新建",
-            "已创建",
-            "已添加",
-            "已记录",
-            "已生成待确认",
-            "已发起",
-            "已修改",
-            "已更新",
-            "已恢复",
-            "已删除",
-            "已经新增",
-            "已经新建",
-            "已经创建",
-            "已经添加",
-            "已经记录",
-            "已经修改",
-            "已经更新",
-            "已经恢复",
-            "已经删除",
-        ],
-    )
+fn allowlist_marker_without_action_success(text: &str, allowlist_markers: &[&str]) -> bool {
+    contains_any(text, allowlist_markers) && !contains_clear_todo_action_success_marker(text)
+}
+
+fn contains_clear_todo_action_success_marker(text: &str) -> bool {
+    [
+        "已新增",
+        "已新建",
+        "已创建",
+        "已添加",
+        "已记录",
+        "已生成待确认",
+        "已发起",
+        "已修改",
+        "已更新",
+        "已恢复",
+        "已删除",
+        "已经新增",
+        "已经新建",
+        "已经创建",
+        "已经添加",
+        "已经记录",
+        "已经修改",
+        "已经更新",
+        "已经恢复",
+        "已经删除",
+    ]
+    .iter()
+    .any(|marker| {
+        text.match_indices(marker)
+            .any(|(pos, _)| !is_explanatory_clear_success_usage(text, pos, marker))
+    })
+}
+
+fn is_explanatory_clear_success_usage(text: &str, pos: usize, marker: &str) -> bool {
+    // “已删除项目不可恢复”是缺参/能力说明里的风险提示，不表示本轮已经删除待办。
+    marker == "已删除" && text[pos..].starts_with("已删除项目不可恢复")
 }
 
 pub(super) fn todo_success_not_verified_reply() -> String {
@@ -349,6 +361,7 @@ mod tests {
             "可以删除已完成待办，但需要先列出并选择具体条目。",
             "暂不支持批量清理全部已完成待办；可以先查看已完成列表。",
             "请提供要删除的已完成待办编号；我还不能确认已经删除任何待办。",
+            "请提供要删除的已完成待办编号；已删除项目不可恢复。",
             "已完成待办可以查看，也可以选择具体条目删除。",
         ] {
             assert_eq!(
@@ -399,6 +412,20 @@ mod tests {
         );
         assert_eq!(
             validate_todo_success_reply(&output("已完成待办已删除。", Vec::new())),
+            TodoSuccessValidation::Blocked
+        );
+        assert_eq!(
+            validate_todo_success_reply(&output(
+                "请提供要删除的已完成待办编号；已删除第一条待办。",
+                Vec::new()
+            )),
+            TodoSuccessValidation::Blocked
+        );
+        assert_eq!(
+            validate_todo_success_reply(&output(
+                "请提供要删除的已完成待办编号；已删除项目不可恢复。第一条待办已删除。",
+                Vec::new()
+            )),
             TodoSuccessValidation::Blocked
         );
     }
