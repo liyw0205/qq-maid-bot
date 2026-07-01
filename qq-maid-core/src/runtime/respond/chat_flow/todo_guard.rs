@@ -87,7 +87,7 @@ fn non_empty_array_field(output: &Value, field: &str) -> bool {
 
 fn reply_claims_todo_write_success(reply: &str) -> bool {
     let text = reply.trim();
-    if text.is_empty() || looks_like_non_success_explanation(text) {
+    if text.is_empty() || explicitly_denies_todo_success(text) {
         return false;
     }
     let normalized: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
@@ -156,7 +156,7 @@ fn reply_claims_todo_write_success(reply: &str) -> bool {
     contains_any(&normalized, &action_markers)
 }
 
-fn looks_like_non_success_explanation(text: &str) -> bool {
+fn explicitly_denies_todo_success(text: &str) -> bool {
     contains_any(
         text,
         &[
@@ -167,13 +167,6 @@ fn looks_like_non_success_explanation(text: &str) -> bool {
             "不能确认",
             "没有收到",
             "没有调用",
-            "暂不支持",
-            "不支持",
-            "不能直接",
-            "无法直接",
-            "请先",
-            "请提供",
-            "需要先",
             "不能算",
             "不算",
         ],
@@ -213,12 +206,22 @@ fn looks_like_todo_status_or_capability_explanation(text: &str) -> bool {
         || contains_any(
             text,
             &[
+                "请提供要删除的已完成待办",
+                "请提供要删除的已完成的待办",
+                "请先查看已完成列表",
+                "请先查询已完成列表",
+                "需要先列出",
+                "需要先查看",
+                "需要先查询",
                 "可以删除已完成待办",
                 "可以删除已完成的待办",
                 "可以查看已完成待办",
                 "可以查看已完成的待办",
                 "可以查询已完成待办",
                 "可以查询已完成的待办",
+                "当前不支持一句话批量清理全部已完成待办",
+                "暂不支持批量清理全部已完成待办",
+                "暂不支持一句话批量清理全部已完成待办",
                 "支持删除已完成待办",
                 "支持删除已完成的待办",
             ],
@@ -339,6 +342,13 @@ mod tests {
         );
         assert_eq!(
             validate_todo_success_reply(&output("已删除待办，还要继续吗？", Vec::new())),
+            TodoSuccessValidation::Blocked
+        );
+        assert_eq!(
+            validate_todo_success_reply(&output(
+                "已删除第一条待办，请先用 /todo 查看确认。",
+                Vec::new()
+            )),
             TodoSuccessValidation::Blocked
         );
     }

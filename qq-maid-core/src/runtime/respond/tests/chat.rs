@@ -691,6 +691,31 @@ async fn todo_create_intent_without_tool_call_does_not_leak_fake_success_reply()
 }
 
 #[tokio::test]
+async fn todo_fake_success_with_followup_instruction_is_still_blocked() {
+    let inspector = MockProvider::new()
+        .with_tool_protocol(ToolCallingProtocol::OpenAiResponses)
+        .with_tool_loop_reply_without_tool("已删除第一条待办，请先用 /todo 查看确认。");
+    let service = test_service_with_provider_and_tool_calling(inspector.clone(), true);
+
+    let response = service
+        .respond(private_message("删除第一条待办"))
+        .await
+        .unwrap();
+
+    let text = response.text.unwrap();
+    assert!(text.contains("没有收到待办工具的成功回执"));
+    let diagnostics = response.diagnostics.unwrap();
+    assert_eq!(diagnostics["todo_success_claimed"], true);
+    assert_eq!(diagnostics["todo_success_verified"], false);
+    assert_eq!(diagnostics["error_code"], "todo_success_not_verified");
+    assert_eq!(
+        diagnostics["tool_loop_executed_tools"],
+        serde_json::json!([])
+    );
+    assert_eq!(inspector.tool_call_count(), 1);
+}
+
+#[tokio::test]
 async fn todo_capability_question_without_tool_call_is_not_required_tool_blocked() {
     let inspector = MockProvider::new()
         .with_tool_protocol(ToolCallingProtocol::OpenAiResponses)
