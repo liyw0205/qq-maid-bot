@@ -35,6 +35,18 @@ fn c2c_text_payload_matches_qq_shape() {
 }
 
 #[test]
+fn c2c_typing_payload_uses_native_typing_message_type() {
+    let payload = build_c2c_typing_payload(Some("msg-1"), 8);
+
+    assert_eq!(payload["msg_type"], 6);
+    assert_eq!(payload["msg_id"], "msg-1");
+    assert_eq!(payload["msg_seq"], 8);
+    assert!(payload.get("content").is_none());
+    assert!(payload.get("markdown").is_none());
+    assert!(payload.get("stream").is_none());
+}
+
+#[test]
 fn c2c_markdown_stream_payload_matches_reference_shape() {
     let first_markdown = MarkdownPayload::new("**hello**");
     let first_payload = build_c2c_markdown_stream_payload(

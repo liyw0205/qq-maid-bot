@@ -16,6 +16,9 @@ pub const DEFAULT_MESSAGE_AGGREGATION_MAX_WAIT_MS: u64 = 3000;
 pub const DEFAULT_MESSAGE_AGGREGATION_MAX_MESSAGES: usize = 10;
 pub const DEFAULT_MESSAGE_AGGREGATION_MAX_CHARS: usize = 12000;
 pub const DEFAULT_MESSAGE_AGGREGATION_MAX_ACTIVE_KEYS: usize = 1024;
+pub const DEFAULT_C2C_FINAL_REPLY_STREAM_ENABLED: bool = true;
+pub const DEFAULT_AGENT_TYPING_ENABLED: bool = true;
+pub const DEFAULT_AGENT_TYPING_DELAY_MS: u64 = 1000;
 /// 普通回复分段软限制默认值（非平台硬上限，仅保守软限制）。
 /// 默认对齐官方非流式长消息分段的 5000 字符基线，尽量减少段数；
 /// 真实 QQ 单条限制仍需真机验证后再校准。
@@ -49,6 +52,9 @@ pub struct AppConfig {
     pub max_active_conversation_workers: usize,
     pub conversation_worker_idle_timeout: Duration,
     pub message_aggregation: MessageAggregationConfig,
+    /// 私聊 Agent 最终回复是否接入 QQ C2C Markdown 流式发送；默认启用，可关闭回滚。
+    pub c2c_final_reply_stream_enabled: bool,
+    pub agent_typing: AgentTypingConfig,
     /// 普通回复 Markdown 通道分段软限制（非平台硬上限）。
     pub markdown_chunk_soft_limit: usize,
     /// 普通回复纯文本通道分段软限制（非平台硬上限）。
@@ -64,6 +70,12 @@ pub struct MessageAggregationConfig {
     pub max_messages: usize,
     pub max_chars: usize,
     pub max_active_keys: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTypingConfig {
+    pub enabled: bool,
+    pub delay: Duration,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -149,6 +161,10 @@ impl AppConfig {
             3600,
         )?;
         let message_aggregation = parse_message_aggregation_config(env)?;
+        let c2c_final_reply_stream_enabled =
+            parse_bool(env, "QQ_MAID_C2C_FINAL_REPLY_STREAM_ENABLED")?
+                .unwrap_or(DEFAULT_C2C_FINAL_REPLY_STREAM_ENABLED);
+        let agent_typing = parse_agent_typing_config(env)?;
         let markdown_chunk_soft_limit = parse_ranged_usize(
             env,
             "QQ_MARKDOWN_CHUNK_SOFT_LIMIT",
@@ -181,10 +197,30 @@ impl AppConfig {
                 conversation_worker_idle_timeout_seconds,
             ),
             message_aggregation,
+            c2c_final_reply_stream_enabled,
+            agent_typing,
             markdown_chunk_soft_limit,
             text_chunk_soft_limit,
         })
     }
+}
+
+fn parse_agent_typing_config(
+    env: &HashMap<String, String>,
+) -> Result<AgentTypingConfig, ConfigError> {
+    let enabled =
+        parse_bool(env, "QQ_MAID_AGENT_TYPING_ENABLED")?.unwrap_or(DEFAULT_AGENT_TYPING_ENABLED);
+    let delay_ms = parse_ranged_u64(
+        env,
+        "QQ_MAID_AGENT_TYPING_DELAY_MS",
+        DEFAULT_AGENT_TYPING_DELAY_MS,
+        100,
+        60_000,
+    )?;
+    Ok(AgentTypingConfig {
+        enabled,
+        delay: Duration::from_millis(delay_ms),
+    })
 }
 
 fn parse_message_aggregation_config(
@@ -426,6 +462,17 @@ mod tests {
             }
         );
         assert_eq!(
+            config.c2c_final_reply_stream_enabled,
+            DEFAULT_C2C_FINAL_REPLY_STREAM_ENABLED
+        );
+        assert_eq!(
+            config.agent_typing,
+            AgentTypingConfig {
+                enabled: DEFAULT_AGENT_TYPING_ENABLED,
+                delay: Duration::from_millis(DEFAULT_AGENT_TYPING_DELAY_MS),
+            }
+        );
+        assert_eq!(
             config.markdown_chunk_soft_limit,
             DEFAULT_MARKDOWN_CHUNK_SOFT_LIMIT
         );
@@ -540,6 +587,9 @@ mod tests {
             ("MESSAGE_AGGREGATION_MAX_MESSAGES", "5"),
             ("MESSAGE_AGGREGATION_MAX_CHARS", "4096"),
             ("MESSAGE_AGGREGATION_MAX_ACTIVE_KEYS", "32"),
+            ("QQ_MAID_C2C_FINAL_REPLY_STREAM_ENABLED", "true"),
+            ("QQ_MAID_AGENT_TYPING_ENABLED", "false"),
+            ("QQ_MAID_AGENT_TYPING_DELAY_MS", "1500"),
             ("QQ_MARKDOWN_CHUNK_SOFT_LIMIT", "1600"),
             ("QQ_TEXT_CHUNK_SOFT_LIMIT", "1500"),
         ]))
@@ -568,6 +618,14 @@ mod tests {
                 max_messages: 5,
                 max_chars: 4096,
                 max_active_keys: 32,
+            }
+        );
+        assert!(config.c2c_final_reply_stream_enabled);
+        assert_eq!(
+            config.agent_typing,
+            AgentTypingConfig {
+                enabled: false,
+                delay: Duration::from_millis(1500),
             }
         );
         assert_eq!(config.markdown_chunk_soft_limit, 1600);
@@ -630,6 +688,16 @@ mod tests {
                     value: 16,
                     min: MIN_CHUNK_SOFT_LIMIT as u64,
                     max: 64_000,
+                },
+            },
+            Case {
+                name: "rejects_agent_typing_delay_below_minimum",
+                map: env_with_creds(&[("QQ_MAID_AGENT_TYPING_DELAY_MS", "10")]),
+                expected_err: ConfigError::IntegerOutOfRange {
+                    name: "QQ_MAID_AGENT_TYPING_DELAY_MS",
+                    value: 10,
+                    min: 100,
+                    max: 60_000,
                 },
             },
         ];

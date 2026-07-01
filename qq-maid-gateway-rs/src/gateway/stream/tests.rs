@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     api::{ApiError, C2cReplyTarget, SendFuture},
     config::{
-        DEFAULT_CONVERSATION_QUEUE_CAPACITY, DEFAULT_MARKDOWN_CHUNK_SOFT_LIMIT,
+        AgentTypingConfig, DEFAULT_CONVERSATION_QUEUE_CAPACITY, DEFAULT_MARKDOWN_CHUNK_SOFT_LIMIT,
         DEFAULT_MAX_ACTIVE_CONVERSATION_WORKERS, DEFAULT_MESSAGE_AGGREGATION_MAX_ACTIVE_KEYS,
         DEFAULT_MESSAGE_AGGREGATION_MAX_CHARS, DEFAULT_MESSAGE_AGGREGATION_MAX_MESSAGES,
         DEFAULT_MESSAGE_AGGREGATION_MAX_WAIT_MS, DEFAULT_MESSAGE_AGGREGATION_QUIET_MS,
@@ -203,6 +203,11 @@ fn test_config() -> AppConfig {
             max_messages: DEFAULT_MESSAGE_AGGREGATION_MAX_MESSAGES,
             max_chars: DEFAULT_MESSAGE_AGGREGATION_MAX_CHARS,
             max_active_keys: DEFAULT_MESSAGE_AGGREGATION_MAX_ACTIVE_KEYS,
+        },
+        c2c_final_reply_stream_enabled: true,
+        agent_typing: AgentTypingConfig {
+            enabled: false,
+            delay: Duration::from_secs(1),
         },
         markdown_chunk_soft_limit: DEFAULT_MARKDOWN_CHUNK_SOFT_LIMIT,
         text_chunk_soft_limit: DEFAULT_TEXT_CHUNK_SOFT_LIMIT,

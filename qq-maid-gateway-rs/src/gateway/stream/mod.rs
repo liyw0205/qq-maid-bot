@@ -17,6 +17,7 @@ use super::{
     logging::{mask_identifier, mask_openid},
     outbound::{RuntimeRecordingSender, record_qq_send_result},
     ping::GatewayRuntimeStatus,
+    typing::{C2cTypingStatusGuard, TypingStopReason},
 };
 use crate::{
     api::{C2cStreamState, OutboundSender, QqApiClient, StreamSendResult},
@@ -122,21 +123,37 @@ pub(super) async fn stream_respond_c2c(
     runtime: &GatewayRuntimeStatus,
     message: &C2cMessage,
     config: &AppConfig,
+    typing: Option<C2cTypingStatusGuard>,
 ) -> anyhow::Result<()> {
     let sender = RuntimeRecordingSender {
         inner: api,
         runtime,
     };
-    stream_respond_c2c_with_sender(stream, &sender, message, config)
+    stream_respond_c2c_with_sender_and_typing(stream, &sender, message, config, typing)
         .await
         .map(|_| ())
 }
 
+#[cfg(test)]
 async fn stream_respond_c2c_with_sender<E, S>(
+    stream: E,
+    sender: &S,
+    message: &C2cMessage,
+    config: &AppConfig,
+) -> anyhow::Result<C2cStreamingPhase>
+where
+    E: RespondEventStream,
+    S: C2cStreamSender + ?Sized,
+{
+    stream_respond_c2c_with_sender_and_typing(stream, sender, message, config, None).await
+}
+
+async fn stream_respond_c2c_with_sender_and_typing<E, S>(
     mut stream: E,
     sender: &S,
     message: &C2cMessage,
     config: &AppConfig,
+    mut typing: Option<C2cTypingStatusGuard>,
 ) -> anyhow::Result<C2cStreamingPhase>
 where
     E: RespondEventStream,
@@ -184,6 +201,9 @@ where
                         .await
                         {
                             Ok(Some(_)) => {
+                                if let Some(typing) = typing.as_mut() {
+                                    typing.stop(TypingStopReason::FirstFrame);
+                                }
                                 let content_chars = pending_delta.chars().count();
                                 pending_delta.clear();
                                 last_send_at = Instant::now();
@@ -306,6 +326,9 @@ where
                 }
             }
             RespondEvent::Completed(response) => {
+                if let Some(typing) = typing.as_mut() {
+                    typing.stop(TypingStopReason::FinalReply);
+                }
                 let final_content = completed_response_content(&response).unwrap_or(&accumulated);
                 let final_chars = final_content.chars().count();
                 match phase {
@@ -531,6 +554,9 @@ where
                 }
             }
             RespondEvent::Failed(failure) => {
+                if let Some(typing) = typing.as_mut() {
+                    typing.stop(TypingStopReason::RequestFailed);
+                }
                 warn!(
                     user = %masked_user,
                     reply_msg_id = %masked_reply_msg_id,
@@ -584,6 +610,9 @@ where
         accumulated_chars,
         "core respond stream closed before Completed"
     );
+    if let Some(typing) = typing.as_mut() {
+        typing.stop(TypingStopReason::Cancelled);
+    }
     match phase {
         C2cStreamingPhase::Active(mut stream_state)
         | C2cStreamingPhase::BrokenActive(mut stream_state) => {

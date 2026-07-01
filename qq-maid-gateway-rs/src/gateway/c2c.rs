@@ -16,6 +16,7 @@ use super::{
         is_ping_command,
     },
     stream::stream_respond_c2c,
+    typing::{C2cTypingStatusGuard, TypingStopReason},
 };
 use crate::{
     api::{C2cReplyTarget, OutboundSender, QqApiClient, send_outbound_with_fallback},
@@ -25,10 +26,11 @@ use crate::{
     message_chunk::{ChunkLimits, OutboundSendError, send_c2c_outbound_chunked},
     render::{OutboundMessage, render_respond_response},
     respond::{
-        RespondClient, RespondResponse, RespondTransport, build_respond_content,
+        RespondClient, RespondEvent, RespondResponse, RespondTransport, build_respond_content,
         respond_error_to_qq_text,
     },
 };
+use qq_maid_core::service::{CoreFailureKind, CoreInboundKind, CoreRespondFailure};
 
 /// 发送 C2C 普通（非流式）回复消息，供真实网关入口调用。
 async fn send_c2c_respond_response(
@@ -205,12 +207,21 @@ pub(super) async fn handle_c2c_message(
         user = %masked_user,
         "calling respond backend"
     );
+    let mut typing = schedule_agent_typing_if_needed(
+        config,
+        respond,
+        api.clone(),
+        &message,
+        respond_content.clone(),
+    )
+    .await;
     let transport = match respond.respond_c2c(&message, respond_content).await {
         Ok(response) => {
             runtime.record_respond_success();
             response
         }
         Err(err) => {
+            stop_typing(&mut typing, TypingStopReason::RequestFailed);
             runtime.record_respond_failure(err.log_summary());
             let qq_text = respond_error_to_qq_text(&err);
             warn!(
@@ -247,13 +258,103 @@ pub(super) async fn handle_c2c_message(
 
     match transport {
         RespondTransport::Complete(response) => {
+            stop_typing(&mut typing, TypingStopReason::FinalReply);
             send_c2c_respond_response(api, runtime, &message, &response, config).await?;
         }
         RespondTransport::Stream(stream) => {
-            stream_respond_c2c(stream, api, runtime, &message, config).await?;
+            if config.c2c_final_reply_stream_enabled {
+                stream_respond_c2c(stream, api, runtime, &message, config, typing).await?;
+            } else {
+                match consume_respond_stream_for_complete(stream).await {
+                    Ok(Some(response)) => {
+                        stop_typing(&mut typing, TypingStopReason::FinalReply);
+                        send_c2c_respond_response(api, runtime, &message, &response, config)
+                            .await?;
+                    }
+                    Ok(None) => {
+                        stop_typing(&mut typing, TypingStopReason::Cancelled);
+                        warn!(
+                            message_id = %message.message_id,
+                            user = %masked_user,
+                            "core respond stream closed before Completed while C2C stream was disabled"
+                        );
+                    }
+                    Err(failure) => {
+                        stop_typing(&mut typing, failure_stop_reason(&failure));
+                        warn!(
+                            message_id = %message.message_id,
+                            user = %masked_user,
+                            kind = ?failure.kind,
+                            retryable = failure.retryable,
+                            "core respond stream failed while C2C stream was disabled"
+                        );
+                        send_c2c_text_with_status(
+                            api,
+                            runtime,
+                            &message.user_openid,
+                            Some(&message.message_id),
+                            &failure.message,
+                        )
+                        .await?;
+                    }
+                }
+            }
         }
     }
     Ok(())
+}
+
+async fn schedule_agent_typing_if_needed(
+    config: &AppConfig,
+    respond: &RespondClient,
+    api: QqApiClient,
+    message: &C2cMessage,
+    respond_content: String,
+) -> Option<C2cTypingStatusGuard> {
+    if !config.agent_typing.enabled {
+        return None;
+    }
+    match respond.classify_c2c(message, respond_content).await {
+        Ok(classification) if classification.kind == CoreInboundKind::NormalChat => {
+            C2cTypingStatusGuard::schedule(&config.agent_typing, api, message, "c2c")
+        }
+        Ok(_) => None,
+        Err(error) => {
+            warn!(
+                message_id = %message.message_id,
+                user = %mask_openid(&message.user_openid),
+                error = %error.log_summary(),
+                "agent typing classification failed; skipping typing status"
+            );
+            None
+        }
+    }
+}
+
+fn stop_typing(typing: &mut Option<C2cTypingStatusGuard>, reason: TypingStopReason) {
+    if let Some(typing) = typing.as_mut() {
+        typing.stop(reason);
+    }
+}
+
+async fn consume_respond_stream_for_complete(
+    mut stream: qq_maid_core::service::CoreResponseStream,
+) -> Result<Option<RespondResponse>, CoreRespondFailure> {
+    while let Some(event) = stream.recv().await {
+        match event {
+            RespondEvent::TextDelta(_) => {}
+            RespondEvent::Completed(response) => return Ok(Some(response)),
+            RespondEvent::Failed(failure) => return Err(failure),
+        }
+    }
+    Ok(None)
+}
+
+fn failure_stop_reason(failure: &CoreRespondFailure) -> TypingStopReason {
+    match failure.kind {
+        CoreFailureKind::SearchTimeout | CoreFailureKind::LlmTimeout => TypingStopReason::Timeout,
+        _ => TypingStopReason::RequestFailed,
+    }
 }
 
 fn render_local_ping_reply(reply: String, enable_markdown: bool) -> OutboundMessage {

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::{
     auth::{AccessTokenManager, AccessTokenSnapshot, AccessTokenSnapshotState},
-    config::AppConfig,
+    config::{AgentTypingConfig, AppConfig},
     gateway::event::C2cMessage,
 };
 use qq_maid_core::service::{CoreHealthSnapshot, UpstreamStatusSnapshot};
@@ -38,6 +38,11 @@ fn config() -> AppConfig {
             max_messages: 10,
             max_chars: 12000,
             max_active_keys: 1024,
+        },
+        c2c_final_reply_stream_enabled: false,
+        agent_typing: AgentTypingConfig {
+            enabled: false,
+            delay: Duration::from_secs(1),
         },
         markdown_chunk_soft_limit: 1800,
         text_chunk_soft_limit: 1800,

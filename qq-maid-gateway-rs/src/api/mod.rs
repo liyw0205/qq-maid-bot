@@ -92,6 +92,14 @@ struct C2cTextPayload<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct C2cTypingPayload<'a> {
+    msg_type: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msg_id: Option<&'a str>,
+    msg_seq: u32,
+}
+
+#[derive(Debug, Serialize)]
 struct GroupTextPayload<'a> {
     content: &'a str,
     msg_type: u8,
@@ -290,6 +298,12 @@ impl QqApiClient {
     ) -> SendResult {
         let payload = build_c2c_text_payload(text, msg_id, self.next_msg_seq());
         self.post_c2c_message(user_openid, msg_id, "text", &payload)
+            .await
+    }
+
+    pub async fn send_c2c_typing(&self, user_openid: &str, msg_id: Option<&str>) -> SendResult {
+        let payload = build_c2c_typing_payload(msg_id, self.next_msg_seq());
+        self.post_c2c_message(user_openid, msg_id, "typing", &payload)
             .await
     }
 
@@ -659,6 +673,15 @@ pub fn build_c2c_text_payload(text: &str, msg_id: Option<&str>, msg_seq: u32) ->
         msg_seq,
     })
     .expect("C2C text payload should serialize")
+}
+
+fn build_c2c_typing_payload(msg_id: Option<&str>, msg_seq: u32) -> Value {
+    serde_json::to_value(C2cTypingPayload {
+        msg_type: 6,
+        msg_id,
+        msg_seq,
+    })
+    .expect("C2C typing payload should serialize")
 }
 
 pub fn build_group_text_payload(text: &str, msg_id: Option<&str>, msg_seq: u32) -> Value {
