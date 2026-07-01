@@ -42,6 +42,26 @@ const TODO_QUERY_COMPLETED_EXACT: &[&str] =
     &["已完成的待办", "看看已完成", "查看已完成", "列出已完成"];
 const TODO_QUERY_CANCELLED_EXACT: &[&str] =
     &["已取消的待办", "看看已取消", "查看已取消", "列出已取消"];
+const TODO_QUERY_COMPLETED_MARKERS: &[&str] =
+    &["已完成", "完成的", "做完", "做完的", "搞定的", "结束的"];
+const TODO_QUERY_CANCELLED_MARKERS: &[&str] =
+    &["已取消", "取消的", "被取消", "取消列表", "已作废", "作废的"];
+const TODO_QUERY_PENDING_NEGATED_COMPLETED_MARKERS: &[&str] = &[
+    "未完成",
+    "没完成",
+    "没有完成",
+    "未做完",
+    "没做完",
+    "没有做完",
+    "还没做完",
+    "还没有做完",
+    "未结束",
+    "没结束",
+    "没有结束",
+    "还没结束",
+];
+const TODO_QUERY_NEGATED_CANCELLED_MARKERS: &[&str] =
+    &["未取消", "没取消", "没有取消", "还没取消", "还没有取消"];
 
 fn remember_todo_query(
     session: &mut SessionRecord,
@@ -293,11 +313,32 @@ fn detect_natural_todo_query_kind(user_text: &str) -> Option<NaturalTodoQueryKin
     if TODO_QUERY_CANCELLED_EXACT.contains(&text.as_str()) {
         return Some(NaturalTodoQueryKind::Cancelled);
     }
-    let mentions_todo = TODO_QUERY_NOUNS.iter().any(|needle| text.contains(needle));
+    let mentions_todo = contains_any(&text, TODO_QUERY_NOUNS);
     let asks_list = TODO_QUERY_LIST_VERBS
         .iter()
         .any(|needle| text.contains(needle));
-    if !mentions_todo || !asks_list {
+    if !asks_list {
+        return None;
+    }
+    let mentions_list = text.contains("列表") || text.contains("清单");
+    let mentions_completed = contains_any(&text, TODO_QUERY_COMPLETED_MARKERS);
+    let mentions_cancelled = contains_any(&text, TODO_QUERY_CANCELLED_MARKERS);
+    let mentions_pending_by_negated_completed =
+        contains_any(&text, TODO_QUERY_PENDING_NEGATED_COMPLETED_MARKERS);
+    let mentions_negated_cancelled = contains_any(&text, TODO_QUERY_NEGATED_CANCELLED_MARKERS);
+    let mentions_state = mentions_completed
+        || mentions_cancelled
+        || mentions_pending_by_negated_completed
+        || mentions_negated_cancelled;
+    if !(mentions_todo || mentions_list && mentions_state) {
+        return None;
+    }
+    // 否定状态必须先于肯定子串判断；例如“未完成的待办”包含“完成的”，
+    // 但语义是进行中列表，不是已完成列表。
+    if mentions_pending_by_negated_completed {
+        return Some(NaturalTodoQueryKind::Pending);
+    }
+    if mentions_negated_cancelled {
         return None;
     }
     if TODO_QUERY_ALL_MARKERS
@@ -306,13 +347,18 @@ fn detect_natural_todo_query_kind(user_text: &str) -> Option<NaturalTodoQueryKin
     {
         return Some(NaturalTodoQueryKind::All);
     }
-    if text.contains("已取消") {
+    // 状态判断只在“列表查询语义”确认后执行，避免“取消这个待办”等写操作被抢走。
+    if mentions_cancelled {
         return Some(NaturalTodoQueryKind::Cancelled);
     }
-    if text.contains("已完成") {
+    if mentions_completed {
         return Some(NaturalTodoQueryKind::Completed);
     }
     Some(NaturalTodoQueryKind::Pending)
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
 }
 
 /// 自然语言待办查询入口统一做别字归一化，避免“代办/待办”落到不同链路。

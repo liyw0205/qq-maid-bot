@@ -146,7 +146,10 @@ impl RustRespondService {
             let output = if validation.passed() {
                 output
             } else {
-                todo_success_not_verified_output(output)
+                todo_success_not_verified_output(
+                    output,
+                    todo_guard::todo_success_not_verified_reply_for_output,
+                )
             };
             (output, validation)
         } else {
@@ -160,6 +163,43 @@ impl RustRespondService {
 
         let reply = output.reply.clone();
         let executed_tools = output.executed_tools.clone();
+        let todo_tool_summaries = todo_guard::todo_tool_result_summaries(&output);
+        if use_tool_loop {
+            if todo_tool_summaries.is_empty() {
+                if todo_success_validation.claimed_success() {
+                    tracing::warn!(
+                        entered_tool_loop = true,
+                        executed_tools = ?executed_tools,
+                        todo_success_claimed = true,
+                        todo_success_verified = todo_success_validation.passed(),
+                        "todo success claim blocked without todo write tool result"
+                    );
+                } else {
+                    tracing::debug!(
+                        entered_tool_loop = true,
+                        executed_tools = ?executed_tools,
+                        "tool loop completed without todo write tool result"
+                    );
+                }
+            } else {
+                for summary in &todo_tool_summaries {
+                    tracing::info!(
+                        entered_tool_loop = true,
+                        tool = %summary.tool,
+                        succeeded = summary.succeeded,
+                        error_code = summary.error_code.as_deref().unwrap_or(""),
+                        requires_confirmation = summary.requires_confirmation,
+                        requires_clarification = summary.requires_clarification,
+                        skipped = summary.skipped,
+                        skip_reason = summary.skip_reason.as_deref().unwrap_or(""),
+                        pending_action = summary.pending_action.as_deref().unwrap_or(""),
+                        todo_success_claimed = todo_success_validation.claimed_success(),
+                        todo_success_verified = todo_success_validation.passed(),
+                        "todo tool result"
+                    );
+                }
+            }
+        }
         if use_tool_loop {
             let mut latest_session = self
                 .session_store
@@ -198,6 +238,16 @@ impl RustRespondService {
             "used_search": false,
             "tool_calling_enabled": use_tool_loop,
             "tool_loop_executed_tools": executed_tools,
+            "todo_tool_results": todo_tool_summaries.iter().map(|summary| json!({
+                "tool": &summary.tool,
+                "succeeded": summary.succeeded,
+                "error_code": &summary.error_code,
+                "requires_confirmation": summary.requires_confirmation,
+                "requires_clarification": summary.requires_clarification,
+                "skipped": summary.skipped,
+                "skip_reason": &summary.skip_reason,
+                "pending_action": &summary.pending_action,
+            })).collect::<Vec<_>>(),
             "todo_success_claimed": todo_success_validation.claimed_success(),
             "todo_success_verified": todo_success_validation.passed(),
             "tool_retry_count": 0,
@@ -436,8 +486,9 @@ impl RustRespondService {
 
 fn todo_success_not_verified_output(
     output: super::llm_service::RespondOutput,
+    reply_builder: impl FnOnce(&super::llm_service::RespondOutput) -> String,
 ) -> super::llm_service::RespondOutput {
-    let reply = todo_guard::todo_success_not_verified_reply();
+    let reply = reply_builder(&output);
     super::llm_service::RespondOutput {
         reply: reply.clone(),
         text: reply.clone(),
