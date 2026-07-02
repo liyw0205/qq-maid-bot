@@ -1,4 +1,5 @@
 use super::*;
+use crate::gateway::typing::{C2cTypingSender, TypingSendFuture};
 use crate::{
     api::{ApiError, C2cReplyTarget, SendFuture},
     config::{
@@ -11,7 +12,7 @@ use crate::{
     media::ImagePayload,
 };
 use qq_maid_core::service::{CoreFailureKind, CoreRespondFailure};
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 #[derive(Debug)]
 struct FakeEventStream {
@@ -72,6 +73,19 @@ enum FakeCall {
 struct FakeStreamSender {
     stream_results: std::sync::Mutex<VecDeque<StreamSendResult>>,
     calls: std::sync::Mutex<Vec<FakeCall>>,
+}
+
+#[derive(Debug)]
+struct NoopTypingSender;
+
+impl C2cTypingSender for NoopTypingSender {
+    fn send_typing<'a>(
+        &'a self,
+        _user_openid: &'a str,
+        _msg_id: Option<&'a str>,
+    ) -> TypingSendFuture<'a> {
+        Box::pin(async move { Ok(None) })
+    }
 }
 
 impl FakeStreamSender {
@@ -788,4 +802,40 @@ async fn core_failed_event_is_returned_as_observable_error() {
 
     assert!(result.is_err());
     assert!(sender.calls().is_empty());
+}
+
+#[tokio::test]
+async fn stream_timeout_failure_stops_typing_with_timeout_reason() {
+    let events = FakeEventStream::new([RespondEvent::Failed(CoreRespondFailure {
+        kind: CoreFailureKind::LlmTimeout,
+        message: "LLM 服务处理超时，请稍后再试。".to_owned(),
+        retryable: true,
+    })]);
+    let sender = FakeStreamSender::new([]);
+    let typing = C2cTypingStatusGuard::schedule_with_sender(
+        &AgentTypingConfig {
+            enabled: true,
+            delay: Duration::from_secs(60),
+        },
+        Arc::new(NoopTypingSender),
+        &c2c_message(),
+        "test",
+    )
+    .unwrap();
+    let stop_reason = typing.stop_reason_probe_for_test();
+
+    let result = stream_respond_c2c_with_sender_and_typing(
+        events,
+        &sender,
+        &c2c_message(),
+        &test_config(),
+        Some(typing),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        *stop_reason.lock().unwrap(),
+        Some(TypingStopReason::Timeout)
+    );
 }

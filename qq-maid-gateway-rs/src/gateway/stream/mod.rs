@@ -25,6 +25,7 @@ use crate::{
     markdown::MarkdownPayload,
     respond::{RespondEvent, RespondResponse},
 };
+use qq_maid_core::service::{CoreFailureKind, CoreRespondFailure};
 
 /// QQ C2C 流式发送的节流间隔（毫秒）。
 ///
@@ -45,6 +46,13 @@ trait RespondEventStream: Send {
 impl RespondEventStream for qq_maid_core::service::CoreResponseStream {
     fn recv_event<'a>(&'a mut self) -> RespondEventFuture<'a> {
         Box::pin(async move { self.recv().await })
+    }
+}
+
+fn failure_stop_reason(failure: &CoreRespondFailure) -> TypingStopReason {
+    match failure.kind {
+        CoreFailureKind::SearchTimeout | CoreFailureKind::LlmTimeout => TypingStopReason::Timeout,
+        _ => TypingStopReason::RequestFailed,
     }
 }
 
@@ -555,7 +563,7 @@ where
             }
             RespondEvent::Failed(failure) => {
                 if let Some(typing) = typing.as_mut() {
-                    typing.stop(TypingStopReason::RequestFailed);
+                    typing.stop(failure_stop_reason(&failure));
                 }
                 warn!(
                     user = %masked_user,
