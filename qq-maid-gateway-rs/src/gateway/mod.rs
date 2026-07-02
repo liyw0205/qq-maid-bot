@@ -14,6 +14,7 @@ pub mod ping;
 mod protocol;
 pub mod push;
 mod stream;
+mod typing;
 
 use std::{
     collections::HashMap,

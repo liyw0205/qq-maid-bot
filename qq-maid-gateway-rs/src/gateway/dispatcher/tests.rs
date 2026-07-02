@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::GroupMessageMode;
+use crate::config::{AgentTypingConfig, GroupMessageMode};
 use std::sync::{Mutex, atomic::AtomicBool};
 use tokio::sync::{Barrier, Notify};
 
@@ -111,6 +111,11 @@ fn test_config() -> AppConfig {
             max_messages: 10,
             max_chars: 12000,
             max_active_keys: 1024,
+        },
+        c2c_final_reply_stream_enabled: false,
+        agent_typing: AgentTypingConfig {
+            enabled: false,
+            delay: Duration::from_secs(1),
         },
         markdown_chunk_soft_limit: 1800,
         text_chunk_soft_limit: 1800,

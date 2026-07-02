@@ -3,6 +3,8 @@
 //! 私聊链路负责本地 `/ping`、Signal Layer 回填、Core 调用和普通回复发送；
 //! C2C 流式发送状态机独立放在 `stream.rs`。
 
+use std::{future::Future, pin::Pin};
+
 use tracing::{debug, info, warn};
 
 use super::{
@@ -16,6 +18,7 @@ use super::{
         is_ping_command,
     },
     stream::stream_respond_c2c,
+    typing::{C2cTypingStatusGuard, TypingStopReason},
 };
 use crate::{
     api::{C2cReplyTarget, OutboundSender, QqApiClient, send_outbound_with_fallback},
@@ -25,10 +28,32 @@ use crate::{
     message_chunk::{ChunkLimits, OutboundSendError, send_c2c_outbound_chunked},
     render::{OutboundMessage, render_respond_response},
     respond::{
-        RespondClient, RespondResponse, RespondTransport, build_respond_content,
+        RespondClient, RespondEvent, RespondResponse, RespondTransport, build_respond_content,
         respond_error_to_qq_text,
     },
 };
+use qq_maid_core::service::{CoreFailureKind, CoreInboundKind, CoreRespondFailure};
+
+const CORE_STREAM_CLOSED_FALLBACK_TEXT: &str = "处理失败，请稍后再试。";
+
+type RespondEventFuture<'a> = Pin<Box<dyn Future<Output = Option<RespondEvent>> + Send + 'a>>;
+
+trait RespondEventStream: Send {
+    fn recv_event<'a>(&'a mut self) -> RespondEventFuture<'a>;
+}
+
+impl RespondEventStream for qq_maid_core::service::CoreResponseStream {
+    fn recv_event<'a>(&'a mut self) -> RespondEventFuture<'a> {
+        Box::pin(async move { self.recv().await })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisabledStreamOutcome {
+    Completed,
+    Failed(CoreFailureKind),
+    ClosedBeforeCompleted,
+}
 
 /// 发送 C2C 普通（非流式）回复消息，供真实网关入口调用。
 async fn send_c2c_respond_response(
@@ -205,12 +230,21 @@ pub(super) async fn handle_c2c_message(
         user = %masked_user,
         "calling respond backend"
     );
+    let mut typing = schedule_agent_typing_if_needed(
+        config,
+        respond,
+        api.clone(),
+        &message,
+        respond_content.clone(),
+    )
+    .await;
     let transport = match respond.respond_c2c(&message, respond_content).await {
         Ok(response) => {
             runtime.record_respond_success();
             response
         }
         Err(err) => {
+            stop_typing(&mut typing, TypingStopReason::RequestFailed);
             runtime.record_respond_failure(err.log_summary());
             let qq_text = respond_error_to_qq_text(&err);
             warn!(
@@ -247,13 +281,128 @@ pub(super) async fn handle_c2c_message(
 
     match transport {
         RespondTransport::Complete(response) => {
+            stop_typing(&mut typing, TypingStopReason::FinalReply);
             send_c2c_respond_response(api, runtime, &message, &response, config).await?;
         }
         RespondTransport::Stream(stream) => {
-            stream_respond_c2c(stream, api, runtime, &message, config).await?;
+            if config.c2c_final_reply_stream_enabled {
+                stream_respond_c2c(stream, api, runtime, &message, config, typing).await?;
+            } else {
+                let sender = RuntimeRecordingSender {
+                    inner: api,
+                    runtime,
+                };
+                let outcome =
+                    handle_c2c_stream_disabled(stream, &sender, &message, config, &mut typing)
+                        .await?;
+                match outcome {
+                    DisabledStreamOutcome::Completed => {}
+                    DisabledStreamOutcome::Failed(kind) => runtime
+                        .record_respond_failure(format!("stream_failed_before_completed:{kind:?}")),
+                    DisabledStreamOutcome::ClosedBeforeCompleted => {
+                        runtime.record_respond_failure("stream_closed_before_completed")
+                    }
+                }
+            }
         }
     }
     Ok(())
+}
+
+async fn schedule_agent_typing_if_needed(
+    config: &AppConfig,
+    respond: &RespondClient,
+    api: QqApiClient,
+    message: &C2cMessage,
+    respond_content: String,
+) -> Option<C2cTypingStatusGuard> {
+    if !config.agent_typing.enabled {
+        return None;
+    }
+    match respond.classify_c2c(message, respond_content).await {
+        Ok(classification) if classification.kind == CoreInboundKind::NormalChat => {
+            C2cTypingStatusGuard::schedule(&config.agent_typing, api, message, "c2c")
+        }
+        Ok(_) => None,
+        Err(error) => {
+            warn!(
+                message_id = %message.message_id,
+                user = %mask_openid(&message.user_openid),
+                error = %error.log_summary(),
+                "agent typing classification failed; skipping typing status"
+            );
+            None
+        }
+    }
+}
+
+fn stop_typing(typing: &mut Option<C2cTypingStatusGuard>, reason: TypingStopReason) {
+    if let Some(typing) = typing.as_mut() {
+        typing.stop(reason);
+    }
+}
+
+async fn handle_c2c_stream_disabled<E, S>(
+    mut stream: E,
+    sender: &S,
+    message: &C2cMessage,
+    config: &AppConfig,
+    typing: &mut Option<C2cTypingStatusGuard>,
+) -> anyhow::Result<DisabledStreamOutcome>
+where
+    E: RespondEventStream,
+    S: OutboundSender + ?Sized,
+{
+    while let Some(event) = stream.recv_event().await {
+        match event {
+            RespondEvent::TextDelta(_) => {}
+            RespondEvent::Completed(response) => {
+                stop_typing(typing, TypingStopReason::FinalReply);
+                send_c2c_respond_response_with_sender(sender, message, &response, config).await?;
+                return Ok(DisabledStreamOutcome::Completed);
+            }
+            RespondEvent::Failed(failure) => {
+                stop_typing(typing, failure_stop_reason(&failure));
+                warn!(
+                    message_id = %message.message_id,
+                    user = %mask_openid(&message.user_openid),
+                    kind = ?failure.kind,
+                    retryable = failure.retryable,
+                    "core respond stream failed while C2C stream was disabled"
+                );
+                send_local_c2c_failure_text(sender, message, &failure.message).await?;
+                return Ok(DisabledStreamOutcome::Failed(failure.kind));
+            }
+        }
+    }
+    stop_typing(typing, TypingStopReason::Cancelled);
+    warn!(
+        message_id = %message.message_id,
+        user = %mask_openid(&message.user_openid),
+        "core respond stream closed before Completed while C2C stream was disabled"
+    );
+    send_local_c2c_failure_text(sender, message, CORE_STREAM_CLOSED_FALLBACK_TEXT).await?;
+    Ok(DisabledStreamOutcome::ClosedBeforeCompleted)
+}
+
+async fn send_local_c2c_failure_text<S: OutboundSender + ?Sized>(
+    sender: &S,
+    message: &C2cMessage,
+    text: &str,
+) -> anyhow::Result<()> {
+    let target = C2cReplyTarget {
+        user_openid: message.user_openid.clone(),
+        msg_id: Some(message.message_id.clone()),
+    };
+    sender.send_text(&target, text).await?;
+    Ok(())
+}
+
+fn failure_stop_reason(failure: &CoreRespondFailure) -> TypingStopReason {
+    match failure.kind {
+        CoreFailureKind::SearchTimeout | CoreFailureKind::LlmTimeout => TypingStopReason::Timeout,
+        _ => TypingStopReason::RequestFailed,
+    }
 }
 
 fn render_local_ping_reply(reply: String, enable_markdown: bool) -> OutboundMessage {
@@ -295,6 +444,162 @@ fn log_c2c_message_received(message: &C2cMessage, verbose_log: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        api::{ApiError, SendFuture},
+        config::{
+            AgentTypingConfig, DEFAULT_CONVERSATION_QUEUE_CAPACITY,
+            DEFAULT_MARKDOWN_CHUNK_SOFT_LIMIT, DEFAULT_MAX_ACTIVE_CONVERSATION_WORKERS,
+            DEFAULT_MESSAGE_AGGREGATION_MAX_ACTIVE_KEYS, DEFAULT_MESSAGE_AGGREGATION_MAX_CHARS,
+            DEFAULT_MESSAGE_AGGREGATION_MAX_MESSAGES, DEFAULT_MESSAGE_AGGREGATION_MAX_WAIT_MS,
+            DEFAULT_MESSAGE_AGGREGATION_QUIET_MS, DEFAULT_TEXT_CHUNK_SOFT_LIMIT, GroupMessageMode,
+            MessageAggregationConfig,
+        },
+        media::ImagePayload,
+    };
+    use qq_maid_core::service::CoreRespondFailure;
+    use std::{collections::VecDeque, sync::Mutex, time::Duration};
+
+    #[derive(Debug)]
+    struct FakeEventStream {
+        events: VecDeque<RespondEvent>,
+    }
+
+    impl FakeEventStream {
+        fn new(events: impl IntoIterator<Item = RespondEvent>) -> Self {
+            Self {
+                events: events.into_iter().collect(),
+            }
+        }
+    }
+
+    impl RespondEventStream for FakeEventStream {
+        fn recv_event<'a>(&'a mut self) -> RespondEventFuture<'a> {
+            Box::pin(async move { self.events.pop_front() })
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FakeCall {
+        Text {
+            content: String,
+            msg_id: Option<String>,
+        },
+        Markdown {
+            content: String,
+            msg_id: Option<String>,
+        },
+        Image,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeOutboundSender {
+        calls: Mutex<Vec<FakeCall>>,
+    }
+
+    impl FakeOutboundSender {
+        fn calls(&self) -> Vec<FakeCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl OutboundSender for FakeOutboundSender {
+        fn send_text<'a>(&'a self, target: &'a C2cReplyTarget, text: &'a str) -> SendFuture<'a> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(FakeCall::Text {
+                    content: text.to_owned(),
+                    msg_id: target.msg_id.clone(),
+                });
+                Ok(Some("text-id".to_owned()))
+            })
+        }
+
+        fn send_markdown<'a>(
+            &'a self,
+            target: &'a C2cReplyTarget,
+            markdown: &'a MarkdownPayload,
+        ) -> SendFuture<'a> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(FakeCall::Markdown {
+                    content: markdown.content.clone(),
+                    msg_id: target.msg_id.clone(),
+                });
+                Ok(Some("markdown-id".to_owned()))
+            })
+        }
+
+        fn send_image<'a>(
+            &'a self,
+            _target: &'a C2cReplyTarget,
+            _image: &'a ImagePayload,
+        ) -> SendFuture<'a> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(FakeCall::Image);
+                Err(ApiError::Unsupported("image"))
+            })
+        }
+    }
+
+    fn c2c_message() -> C2cMessage {
+        C2cMessage {
+            message_id: "msg-1".to_owned(),
+            event_id: Some("event-1".to_owned()),
+            source_message_ids: vec!["msg-1".to_owned()],
+            source_event_ids: vec!["event-1".to_owned()],
+            user_openid: "user-1".to_owned(),
+            content: "晚上好".to_owned(),
+            reply: None,
+            timestamp: None,
+            first_message_timestamp: None,
+            last_message_timestamp: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    fn respond_response(text: &str) -> RespondResponse {
+        RespondResponse {
+            text: Some(text.to_owned()),
+            markdown: Some(text.to_owned()),
+            handled: Some(true),
+            session_id: None,
+            command: None,
+            diagnostics: None,
+        }
+    }
+
+    fn test_config() -> AppConfig {
+        AppConfig {
+            app_id: "app".to_owned(),
+            app_secret: "secret".to_owned(),
+            sandbox: false,
+            api_base: "https://example.test".to_owned(),
+            token_refresh_margin: Duration::from_secs(60),
+            enable_markdown: true,
+            enable_image: false,
+            enable_group_messages: false,
+            verbose_log: false,
+            group_message_mode: GroupMessageMode::Mention,
+            group_active_keywords: vec!["小女仆".to_owned()],
+            conversation_queue_capacity: DEFAULT_CONVERSATION_QUEUE_CAPACITY,
+            max_active_conversation_workers: DEFAULT_MAX_ACTIVE_CONVERSATION_WORKERS,
+            conversation_worker_idle_timeout: Duration::from_secs(300),
+            message_aggregation: MessageAggregationConfig {
+                private_enabled: true,
+                group_enabled: false,
+                quiet: Duration::from_millis(DEFAULT_MESSAGE_AGGREGATION_QUIET_MS),
+                max_wait: Duration::from_millis(DEFAULT_MESSAGE_AGGREGATION_MAX_WAIT_MS),
+                max_messages: DEFAULT_MESSAGE_AGGREGATION_MAX_MESSAGES,
+                max_chars: DEFAULT_MESSAGE_AGGREGATION_MAX_CHARS,
+                max_active_keys: DEFAULT_MESSAGE_AGGREGATION_MAX_ACTIVE_KEYS,
+            },
+            c2c_final_reply_stream_enabled: false,
+            agent_typing: AgentTypingConfig {
+                enabled: false,
+                delay: Duration::from_secs(1),
+            },
+            markdown_chunk_soft_limit: DEFAULT_MARKDOWN_CHUNK_SOFT_LIMIT,
+            text_chunk_soft_limit: DEFAULT_TEXT_CHUNK_SOFT_LIMIT,
+        }
+    }
 
     #[test]
     fn local_ping_reply_respects_markdown_config() {
@@ -313,6 +618,97 @@ mod tests {
             OutboundMessage::Text {
                 text: "# 状态".to_owned(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_stream_completed_sends_single_ordinary_reply() {
+        let events = FakeEventStream::new([
+            RespondEvent::TextDelta("不应外发".to_owned()),
+            RespondEvent::Completed(respond_response("最终回复")),
+        ]);
+        let sender = FakeOutboundSender::default();
+        let mut typing = None;
+
+        let outcome = handle_c2c_stream_disabled(
+            events,
+            &sender,
+            &c2c_message(),
+            &test_config(),
+            &mut typing,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, DisabledStreamOutcome::Completed);
+        assert_eq!(
+            sender.calls(),
+            vec![FakeCall::Markdown {
+                content: "最终回复".to_owned(),
+                msg_id: Some("msg-1".to_owned()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_stream_failed_sends_safe_failure_without_reinvoking_core() {
+        let events = FakeEventStream::new([
+            RespondEvent::TextDelta("不完整".to_owned()),
+            RespondEvent::Failed(CoreRespondFailure {
+                kind: CoreFailureKind::LlmFailed,
+                message: "上游服务暂时不可用，请稍后再试。".to_owned(),
+                retryable: true,
+            }),
+        ]);
+        let sender = FakeOutboundSender::default();
+        let mut typing = None;
+
+        let outcome = handle_c2c_stream_disabled(
+            events,
+            &sender,
+            &c2c_message(),
+            &test_config(),
+            &mut typing,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            DisabledStreamOutcome::Failed(CoreFailureKind::LlmFailed)
+        );
+        assert_eq!(
+            sender.calls(),
+            vec![FakeCall::Text {
+                content: "上游服务暂时不可用，请稍后再试。".to_owned(),
+                msg_id: Some("msg-1".to_owned()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_stream_closed_before_completed_sends_fixed_failure_not_delta() {
+        let events = FakeEventStream::new([RespondEvent::TextDelta("半截回复".to_owned())]);
+        let sender = FakeOutboundSender::default();
+        let mut typing = None;
+
+        let outcome = handle_c2c_stream_disabled(
+            events,
+            &sender,
+            &c2c_message(),
+            &test_config(),
+            &mut typing,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, DisabledStreamOutcome::ClosedBeforeCompleted);
+        assert_eq!(
+            sender.calls(),
+            vec![FakeCall::Text {
+                content: CORE_STREAM_CLOSED_FALLBACK_TEXT.to_owned(),
+                msg_id: Some("msg-1".to_owned()),
+            }]
         );
     }
 }

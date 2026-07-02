@@ -719,7 +719,7 @@ impl AggregatorActor {
 mod tests {
     use super::*;
     use crate::{
-        config::{AppConfig, GroupMessageMode},
+        config::{AgentTypingConfig, AppConfig, GroupMessageMode},
         gateway::{dedupe::MessageDedupe, event::GroupMessage},
         respond::RespondClient,
     };
@@ -837,6 +837,11 @@ mod tests {
                 max_messages: 3,
                 max_chars: 12,
                 max_active_keys: 4,
+            },
+            c2c_final_reply_stream_enabled: false,
+            agent_typing: AgentTypingConfig {
+                enabled: false,
+                delay: Duration::from_secs(1),
             },
             markdown_chunk_soft_limit: 1800,
             text_chunk_soft_limit: 1800,
