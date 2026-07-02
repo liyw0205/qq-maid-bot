@@ -15,9 +15,9 @@ use crate::{
 };
 
 use super::common::{
-    DELETE_TODOS_TOOL_NAME, TODO_DELETE_INVALID_STATE_CODE, TODO_DELETE_MIXED_STATUS_CODE,
-    TODO_REFERENCE_UNAVAILABLE_CODE, TODO_SELECTION_NOT_FOUND_CODE, bad_tool_arguments,
-    optional_text, todo_selection_request, todo_tool_error, todo_tool_error_output,
+    DELETE_TODOS_TOOL_NAME, TODO_REFERENCE_UNAVAILABLE_CODE, TODO_SELECTION_NOT_FOUND_CODE,
+    bad_tool_arguments, optional_text, todo_selection_request, todo_tool_error,
+    todo_tool_error_output,
 };
 use super::json::{status_label, todo_plain_item_json, todo_plain_items_json};
 use super::scope::{
@@ -58,7 +58,7 @@ impl Tool for DeleteTodoTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             name: DELETE_TODOS_TOOL_NAME.to_owned(),
-            description: "发起永久删除已完成或已取消待办，必须二次确认后才真正删除。支持四种互斥选择：numbers=用户最近实际看到的 visible_number；reference=\"last\"；query=标题或文本条件；all_status=\"completed\"/\"cancelled\" 表示全部对应终态。未完成待办不能永久删除，用户说“不做了/取消/算了”时必须调用 cancel_todo。".to_owned(),
+            description: "发起永久删除待办，必须二次确认后才真正删除。支持四种互斥选择：numbers=用户最近实际看到的 visible_number；selection_text=用户原始编号范围；reference=\"last\"；query=标题或文本条件；all_status=\"completed\"/\"cancelled\" 表示全部对应状态。用户明确说“删除/永久删除”时使用本工具；用户说“不做了/取消/算了”时使用 cancel_todo。".to_owned(),
             parameters: delete_todos_schema(),
         }
     }
@@ -154,7 +154,7 @@ fn delete_todos_schema() -> Value {
             },
             "query": {
                 "type": ["string", "null"],
-                "description": "按标题、详情或原始文本在已完成/已取消待办中查找目标；例如“和老公出门”“飞机票”。"
+                "description": "按标题、详情或原始文本在全部待办中查找目标；例如“和老公出门”“飞机票”。"
             },
             "all_status": {
                 "type": ["string", "null"],
@@ -296,22 +296,17 @@ impl DeleteTodoTool {
         arguments: &Value,
         query: &str,
     ) -> Result<DeleteSelection, LlmError> {
-        let mut terminal = self
+        let all_items = self
             .todo_store
-            .list_completed(&scope.owner)
+            .list_all(&scope.owner)
             .map_err(todo_tool_error)?;
-        terminal.extend(
-            self.todo_store
-                .list_cancelled(&scope.owner)
-                .map_err(todo_tool_error)?,
-        );
-        let exact = terminal
+        let exact = all_items
             .iter()
             .filter(|item| normalized(&item.title) == normalized(query))
             .cloned()
             .collect::<Vec<_>>();
         let matches = if exact.is_empty() {
-            terminal
+            all_items
                 .into_iter()
                 .filter(|item| item_matches_query(item, query))
                 .collect::<Vec<_>>()
@@ -320,22 +315,9 @@ impl DeleteTodoTool {
         };
 
         if matches.is_empty() {
-            let pending_matches = self
-                .todo_store
-                .list_pending(&scope.owner)
-                .map_err(todo_tool_error)?
-                .into_iter()
-                .filter(|item| item_matches_query(item, query))
-                .collect::<Vec<_>>();
-            if !pending_matches.is_empty() {
-                return Ok(DeleteSelection::Output(todo_tool_error_output(
-                    TODO_DELETE_INVALID_STATE_CODE,
-                    "matched pending todos cannot be permanently deleted; use cancel_todo first",
-                )));
-            }
             return Ok(DeleteSelection::Output(todo_tool_error_output(
                 TODO_SELECTION_NOT_FOUND_CODE,
-                "no completed or cancelled todo matched query",
+                "no todo matched query",
             )));
         }
         if matches.len() == 1 {
@@ -352,7 +334,7 @@ impl DeleteTodoTool {
                 arguments,
                 false,
                 TODO_SELECTION_NOT_FOUND_CODE,
-                "multiple completed or cancelled todos matched query",
+                "multiple todos matched query",
                 candidates,
             )?,
         ))
@@ -383,24 +365,12 @@ fn create_delete_confirmation(
     items: Vec<TodoItem>,
     source_condition: String,
 ) -> Result<ToolOutput, LlmError> {
-    if items.iter().any(|item| item.status == TodoStatus::Pending) {
-        return Ok(todo_tool_error_output(
-            TODO_DELETE_INVALID_STATE_CODE,
-            "pending todos cannot be permanently deleted; use cancel_todo to mark them cancelled",
-        ));
-    }
     let Some(status) = items.first().map(|item| item.status.clone()) else {
         return Ok(todo_tool_error_output(
             TODO_SELECTION_NOT_FOUND_CODE,
             "no todo selected for deletion",
         ));
     };
-    if items.iter().any(|item| item.status != status) {
-        return Ok(todo_tool_error_output(
-            TODO_DELETE_MIXED_STATUS_CODE,
-            "delete_todos requires all selected todos to have the same terminal status",
-        ));
-    }
 
     scope.ensure_no_pending()?;
     let created_at = now_iso_cn();

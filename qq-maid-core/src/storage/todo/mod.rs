@@ -193,7 +193,7 @@ pub struct TodoBulkRestoreOutcome {
     pub skipped_ids: Vec<String>,
 }
 
-/// 批量物理删除已取消待办事项的结果。
+/// 批量物理删除待办事项的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TodoBulkDeleteOutcome {
     pub deleted_count: usize,
@@ -796,6 +796,49 @@ impl TodoStore {
         ids: &[String],
     ) -> Result<TodoBulkDeleteOutcome, TodoError> {
         self.delete_by_ids_with_status(owner, ids, TodoStatus::Cancelled)
+    }
+
+    /// 按 ID 物理删除任意状态的待办事项。
+    ///
+    /// 业务层已经把 `delete` 明确为永久删除，并在进入这里前完成用户确认；存储层只
+    /// 继续校验 owner 与 scope，避免状态变化期间误删其他会话或其他用户的记录。
+    pub fn delete_by_ids(
+        &self,
+        owner: &TodoOwner,
+        ids: &[String],
+    ) -> Result<TodoBulkDeleteOutcome, TodoError> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction().map_err(TodoError::from_sql)?;
+        let mut deleted_count = 0usize;
+        let mut skipped_ids = Vec::new();
+
+        for id_text in ids.iter().map(|id| clean_todo_id(id)) {
+            let Some(id) = parse_todo_db_id(&id_text) else {
+                if !id_text.is_empty() {
+                    skipped_ids.push(id_text);
+                }
+                continue;
+            };
+            let affected = tx
+                .execute(
+                    "DELETE FROM todos
+                     WHERE id = ?1
+                       AND owner_key = ?2
+                       AND scope_key = ?3",
+                    params![id, owner.key.as_str(), owner.scope_key.as_str()],
+                )
+                .map_err(TodoError::from_sql)?;
+            if affected == 0 {
+                skipped_ids.push(id_text);
+            } else {
+                deleted_count += affected;
+            }
+        }
+        tx.commit().map_err(TodoError::from_sql)?;
+        Ok(TodoBulkDeleteOutcome {
+            deleted_count,
+            skipped_ids,
+        })
     }
 
     /// 按指定终态物理删除记录，并在事务内校验 owner、scope 和 status。

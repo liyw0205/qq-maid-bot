@@ -1608,7 +1608,7 @@ async fn todo_edit_tool_false_result_does_not_pass_success_guard() {
 }
 
 #[tokio::test]
-async fn todo_delete_tool_false_result_does_not_pass_success_guard() {
+async fn todo_delete_pending_item_false_deleted_text_does_not_pass_success_guard() {
     let inspector = MockProvider::new()
         .with_tool_protocol(ToolCallingProtocol::OpenAiResponses)
         .with_tool_call_json(
@@ -1628,7 +1628,7 @@ async fn todo_delete_tool_false_result_does_not_pass_success_guard() {
         .create(
             &owner,
             TodoItemDraft {
-                title: "未完成不能永久删除".to_owned(),
+                title: "进行中可发起永久删除确认".to_owned(),
                 detail: None,
                 raw_text: None,
                 due_date: None,
@@ -1648,17 +1648,23 @@ async fn todo_delete_tool_false_result_does_not_pass_success_guard() {
         .unwrap();
 
     let text = response.text.unwrap();
-    assert!(text.contains("进行中的待办不能永久删除"));
+    assert!(text.contains("确认删除以下 1 项待办吗"));
     let diagnostics = response.diagnostics.unwrap();
     assert_eq!(diagnostics["todo_success_claimed"], true);
-    assert_eq!(diagnostics["todo_success_verified"], false);
+    assert_eq!(diagnostics["todo_success_verified"], true);
     assert_eq!(diagnostics["tool_retry_count"], 0);
-    assert_eq!(diagnostics["error_code"], "todo_delete_invalid_state");
-    assert_eq!(
-        diagnostics["todo_tool_results"][0]["error_code"],
-        "todo_delete_invalid_state"
-    );
     assert!(service.todo_store.list_pending(&owner).unwrap().len() == 1);
+    let session = service
+        .session_store
+        .get_or_create_active(&private_test_meta())
+        .unwrap();
+    match session.pending_operation {
+        Some(PendingOperation::TodoDelete { item, .. }) => {
+            assert_eq!(item.title, "进行中可发起永久删除确认");
+            assert_eq!(item.status, TodoStatus::Pending);
+        }
+        other => panic!("expected delete pending operation, got {other:?}"),
+    }
 }
 
 #[tokio::test]

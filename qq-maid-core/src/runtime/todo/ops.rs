@@ -161,23 +161,6 @@ pub fn restore_both(
     })
 }
 
-/// 软取消单条待办（仅状态变更为已取消），并维护 session 快照。
-///
-/// 用于 pending `TodoDelete` 确认分支中“未完成待办”的软删除语义：历史实现会清空
-/// `last_todo_query` 并记录 “cancelled” 最近对象，这里保持完全一致。
-/// 物理删除已完成/已取消待办不经过这里，仍由调用方直接走带状态校验的存储接口。
-pub fn cancel_one(
-    store: &TodoStore,
-    session: &mut SessionRecord,
-    owner: &TodoOwner,
-    id: &str,
-) -> Result<TodoItem, crate::runtime::todo::TodoError> {
-    let deleted = store.cancel(owner, id)?;
-    session.last_todo_query = None;
-    session.remember_last_todo_action(&owner.key, &deleted, "cancelled");
-    Ok(deleted)
-}
-
 /// 批量软取消待办（仅 Pending -> Cancelled），并维护 session 快照。
 ///
 /// 取消是可恢复状态变更，不进入确认 Pending；目标 ID 必须由 Tool 层先完成

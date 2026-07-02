@@ -34,7 +34,7 @@ use crate::{
             todo_lexicon,
         },
         session::{LAST_QUERY_TTL_SECONDS, SessionRecord, query_is_fresh},
-        todo::{TodoOwner, TodoStatus},
+        todo::TodoOwner,
         tools::{CancelTodoTool, CompleteTodoTool, DeleteTodoTool, EditTodoTool, RestoreTodoTool},
     },
 };
@@ -112,65 +112,31 @@ impl RustRespondService {
                     )?));
                 }
                 if matches!(reply_kind, PendingReplyKind::Confirm) {
-                    let reply = match item.status {
-                        TodoStatus::Pending => CommandBody::plain(
-                            "这条待办仍在进行中，不能作为删除确认执行。若不再需要，请重新说“取消这条待办”。",
-                        ),
-                        TodoStatus::Completed => {
-                            let outcome = self
-                                .todo_store
-                                .delete_completed_by_ids(owner, std::slice::from_ref(&item.id))
-                                .map_err(todo_error)?;
-                            if outcome.deleted_count == 0 {
-                                return Ok(Some(self.clear_pending_response(
-                                    session,
-                                    user_text,
-                                    CommandBody::plain("没有可删除的已完成待办。"),
-                                    "todo_confirm",
-                                )?));
-                            }
-                            session.clear_last_todo_action_if_matches_any(
-                                &owner.key,
-                                std::slice::from_ref(&item.id),
-                            );
-                            receipt_after_deleted(
-                                &self.todo_store,
-                                session,
-                                owner,
-                                TodoStatus::Completed,
-                                outcome.deleted_count,
-                                0,
-                            )?
-                            .body
-                        }
-                        TodoStatus::Cancelled => {
-                            let outcome = self
-                                .todo_store
-                                .delete_cancelled_by_ids(owner, std::slice::from_ref(&item.id))
-                                .map_err(todo_error)?;
-                            if outcome.deleted_count == 0 {
-                                return Ok(Some(self.clear_pending_response(
-                                    session,
-                                    user_text,
-                                    CommandBody::plain("当前没有已取消待办需要删除。"),
-                                    "todo_confirm",
-                                )?));
-                            }
-                            session.clear_last_todo_action_if_matches_any(
-                                &owner.key,
-                                std::slice::from_ref(&item.id),
-                            );
-                            receipt_after_deleted(
-                                &self.todo_store,
-                                session,
-                                owner,
-                                TodoStatus::Cancelled,
-                                outcome.deleted_count,
-                                0,
-                            )?
-                            .body
-                        }
-                    };
+                    let outcome = self
+                        .todo_store
+                        .delete_by_ids(owner, std::slice::from_ref(&item.id))
+                        .map_err(todo_error)?;
+                    if outcome.deleted_count == 0 {
+                        return Ok(Some(self.clear_pending_response(
+                            session,
+                            user_text,
+                            CommandBody::plain("这条待办已不存在或不属于当前会话，没有执行删除。"),
+                            "todo_confirm",
+                        )?));
+                    }
+                    session.clear_last_todo_action_if_matches_any(
+                        &owner.key,
+                        std::slice::from_ref(&item.id),
+                    );
+                    let reply = receipt_after_deleted(
+                        &self.todo_store,
+                        session,
+                        owner,
+                        item.status,
+                        outcome.deleted_count,
+                        0,
+                    )?
+                    .body;
                     return Ok(Some(self.clear_pending_response(
                         session,
                         user_text,
@@ -202,53 +168,26 @@ impl RustRespondService {
                     )?));
                 }
                 if matches!(reply_kind, PendingReplyKind::Confirm) {
-                    let reply = match status {
-                        TodoStatus::Completed => {
-                            let outcome = self
-                                .todo_store
-                                .delete_completed_by_ids(owner, &item_ids)
-                                .map_err(todo_error)?;
-                            session.clear_last_todo_action_if_matches_any(&owner.key, &item_ids);
-                            let source_count = if matched_count == 0 {
-                                item_ids.len()
-                            } else {
-                                matched_count
-                            };
-                            let skipped_count = source_count.saturating_sub(outcome.deleted_count);
-                            receipt_after_deleted(
-                                &self.todo_store,
-                                session,
-                                owner,
-                                TodoStatus::Completed,
-                                outcome.deleted_count,
-                                skipped_count,
-                            )?
-                            .body
-                        }
-                        TodoStatus::Cancelled => {
-                            let outcome = self
-                                .todo_store
-                                .delete_cancelled_by_ids(owner, &item_ids)
-                                .map_err(todo_error)?;
-                            session.clear_last_todo_action_if_matches_any(&owner.key, &item_ids);
-                            let source_count = if matched_count == 0 {
-                                item_ids.len()
-                            } else {
-                                matched_count
-                            };
-                            let skipped_count = source_count.saturating_sub(outcome.deleted_count);
-                            receipt_after_deleted(
-                                &self.todo_store,
-                                session,
-                                owner,
-                                TodoStatus::Cancelled,
-                                outcome.deleted_count,
-                                skipped_count,
-                            )?
-                            .body
-                        }
-                        TodoStatus::Pending => CommandBody::plain("不支持批量删除未完成待办。"),
+                    let outcome = self
+                        .todo_store
+                        .delete_by_ids(owner, &item_ids)
+                        .map_err(todo_error)?;
+                    session.clear_last_todo_action_if_matches_any(&owner.key, &item_ids);
+                    let source_count = if matched_count == 0 {
+                        item_ids.len()
+                    } else {
+                        matched_count
                     };
+                    let skipped_count = source_count.saturating_sub(outcome.deleted_count);
+                    let reply = receipt_after_deleted(
+                        &self.todo_store,
+                        session,
+                        owner,
+                        status,
+                        outcome.deleted_count,
+                        skipped_count,
+                    )?
+                    .body;
                     return Ok(Some(self.clear_pending_response(
                         session,
                         user_text,

@@ -864,10 +864,10 @@ fn error_reply_for_tool_result(output: &Value) -> String {
             "没有找到符合条件的待办，或可见编号已经失效。请查看最新列表后再操作。".to_owned()
         }
         Some("todo_delete_invalid_state") => {
-            "进行中的待办不能永久删除；如不再需要，请先取消它。".to_owned()
+            "目标待办当前无法永久删除，请查看最新列表后再试。".to_owned()
         }
         Some("todo_delete_mixed_status") => {
-            "不能把已完成和已取消待办混在同一次永久删除里。请分状态删除。".to_owned()
+            "这次永久删除没有成功，请查看最新列表后再试。".to_owned()
         }
         Some("todo_pending_exists") | Some("todo_pending_conflict") => {
             "当前已有待确认的待办操作，请先回复“确认”或“取消”。".to_owned()

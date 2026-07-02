@@ -130,7 +130,7 @@ async fn todo_add_pending_confirm_and_cancel_are_supported_for_tool_path() {
 }
 
 #[tokio::test]
-async fn todo_delete_pending_pending_item_confirm_does_not_cancel() {
+async fn todo_delete_pending_item_confirm_permanently_deletes() {
     let service = test_service();
     let owner = TodoStore::owner(Some("u1"), "group:g1");
     let item = service.todo_store.create(&owner, draft("买牛奶")).unwrap();
@@ -166,15 +166,18 @@ async fn todo_delete_pending_pending_item_confirm_does_not_cancel() {
         },
     );
     let confirmed = service.respond(message("确认")).await.unwrap();
-    assert!(confirmed.text.unwrap().contains("不能作为删除确认执行"));
-    assert_eq!(
+    assert!(
+        confirmed
+            .text
+            .unwrap()
+            .contains("已永久删除 1 条进行中待办")
+    );
+    assert!(
         service
             .todo_store
             .get_by_id(&owner, &item.id)
             .unwrap()
-            .unwrap()
-            .status,
-        TodoStatus::Pending
+            .is_none()
     );
 }
 
@@ -253,17 +256,24 @@ async fn todo_add_confirm_keeps_fresh_last_todo_action_over_stale_db_snapshot() 
 }
 
 #[tokio::test]
-async fn todo_delete_confirm_pending_item_keeps_stale_snapshot_without_mutation() {
+async fn todo_delete_confirm_pending_item_refreshes_snapshot_after_delete() {
     let service = test_service();
     let owner = TodoStore::owner(Some("u1"), "group:g1");
     let item = service.todo_store.create(&owner, draft("待取消")).unwrap();
 
-    // 删除确认只允许永久删除终态待办；进行中待办不会在确认分支降级为取消。
+    let other = service.todo_store.create(&owner, draft("保留")).unwrap();
+
+    // 删除确认执行保存的原始 delete 计划；即使目标仍在进行中，也不会降级为取消。
     let mut session = service
         .session_store
         .get_or_create_active(&test_meta())
         .unwrap();
-    session.remember_last_todo_query(&owner.key, "list", "", vec![item.id.clone()]);
+    session.remember_last_todo_query(
+        &owner.key,
+        "list",
+        "",
+        vec![item.id.clone(), other.id.clone()],
+    );
     session.pending_operation = Some(PendingOperation::TodoDelete {
         initiator_user_id: Some("u1".to_owned()),
         owner_key: owner.key.clone(),
@@ -274,7 +284,7 @@ async fn todo_delete_confirm_pending_item_keeps_stale_snapshot_without_mutation(
 
     let confirmed = service.respond(message("确认")).await.unwrap();
     let text = confirmed.text.unwrap();
-    assert!(text.contains("不能作为删除确认执行"));
+    assert!(text.contains("已永久删除 1 条进行中待办"));
 
     let session = service
         .session_store
@@ -283,14 +293,21 @@ async fn todo_delete_confirm_pending_item_keeps_stale_snapshot_without_mutation(
     let snapshot = session
         .last_todo_query
         .as_ref()
-        .expect("missing original snapshot");
+        .expect("missing refreshed snapshot");
     assert_eq!(snapshot.query_type, "list");
-    assert_eq!(snapshot.result_ids, vec![item.id.clone()]);
+    assert_eq!(snapshot.result_ids, vec![other.id.clone()]);
     assert!(session.last_todo_action.is_none());
-    assert_eq!(
+    assert!(
         service
             .todo_store
             .get_by_id(&owner, &item.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        service
+            .todo_store
+            .get_by_id(&owner, &other.id)
             .unwrap()
             .unwrap()
             .status,

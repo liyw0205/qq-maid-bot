@@ -863,7 +863,7 @@ async fn delete_tool_query_multiple_creates_clarification_without_snapshot_pollu
 }
 
 #[tokio::test]
-async fn delete_tool_query_pending_match_rejects_permanent_delete() {
+async fn delete_tool_query_pending_match_creates_confirmation() {
     let (todo_store, session_store, owner) = test_stores();
     todo_store
         .create(
@@ -889,8 +889,9 @@ async fn delete_tool_query_pending_match_rejects_permanent_delete() {
         .unwrap()
         .value;
 
-    assert_eq!(output["ok"], false);
-    assert_eq!(output["error_code"], "todo_delete_invalid_state");
+    assert_eq!(output["ok"], true);
+    assert_eq!(output["requires_confirmation"], true);
+    assert_eq!(output["pending_action"], "delete");
     let session = session_store
         .get_or_create_active(&SessionMeta::new(
             "private:u1",
@@ -901,7 +902,13 @@ async fn delete_tool_query_pending_match_rejects_permanent_delete() {
             "qq_official",
         ))
         .unwrap();
-    assert!(session.pending_operation.is_none());
+    match session.pending_operation {
+        Some(PendingOperation::TodoDelete { item, .. }) => {
+            assert_eq!(item.title, "还没做不能永久删");
+            assert_eq!(item.status, TodoStatus::Pending);
+        }
+        other => panic!("expected delete pending, got {other:?}"),
+    }
 }
 
 #[tokio::test]
