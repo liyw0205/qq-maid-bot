@@ -28,7 +28,6 @@ pub const DEFAULT_SERVER_PORT: u16 = 8787; // 监听端口
 pub const DEFAULT_APP_DB_FILE: &str = "data/storage/app.db"; // 项目通用 SQLite 文件
 pub const DEFAULT_PROMPT_DIR: &str = "config/prompts"; // 提示词模板目录
 pub const DEFAULT_KNOWLEDGE_DIR: &str = "config/knowledge"; // Markdown 知识目录
-pub const DEFAULT_MEMBER_ID_MAPPING_FILE: &str = "config/member_id_mapping.json"; // 成员 ID 映射文件
 pub const DEFAULT_RSS_POLL_INTERVAL_SECONDS: u64 = 300; // RSS 轮询间隔
 pub const DEFAULT_RSS_HTTP_TIMEOUT_SECONDS: u64 = 15; // RSS HTTP 请求超时
 pub const DEFAULT_RSS_MAX_BODY_BYTES: u64 = 2 * 1024 * 1024; // RSS 响应体大小上限
@@ -217,8 +216,6 @@ pub struct AppConfig {
     pub prompt_dir_uses_builtin_defaults: bool,
     /// Markdown 知识目录；普通聊天会从已同步索引中按需检索相关片段。
     pub knowledge_dir: String,
-    /// 群成员 ID 映射文件路径
-    pub member_id_mapping_file: String,
     /// 和风天气 API 密钥
     pub qweather_api_key: String,
     /// 和风天气 API 主机地址
@@ -342,8 +339,6 @@ impl AppConfig {
                 .unwrap_or_else(default_prompt_dir),
             prompt_dir_uses_builtin_defaults: configured_prompt_dir.is_none(),
             knowledge_dir: env_optional("KNOWLEDGE_DIR").unwrap_or_else(default_knowledge_dir),
-            member_id_mapping_file: env_optional("MEMBER_ID_MAPPING_FILE")
-                .unwrap_or_else(|| DEFAULT_MEMBER_ID_MAPPING_FILE.to_owned()),
             qweather_api_key,
             qweather_api_host,
             qweather_geo_host,

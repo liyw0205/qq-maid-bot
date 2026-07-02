@@ -334,7 +334,7 @@ pub(super) fn parse_pending_bypass_session_command(text: &str) -> Option<ParsedC
     }
 }
 
-/// 格式化当前会话状态的展示文本（话题、说话者、场景、模式等）。
+/// 格式化当前会话状态的展示文本。
 fn format_session_state_reply(session: &SessionRecord) -> String {
     if session.state.is_empty() && session.summary.trim().is_empty() && session.history.is_empty() {
         return "当前没有明确话题。小女仆桌面是空的，可以直接开新话题。".to_owned();
@@ -342,18 +342,8 @@ fn format_session_state_reply(session: &SessionRecord) -> String {
     let topic = state_string(session, "current_topic")
         .or_else(|| context_session_title(Some(session.title.as_str())))
         .unwrap_or_else(|| "未明确".to_owned());
-    let speaker =
-        state_string(session, "current_speaker_hint").unwrap_or_else(|| "未明确".to_owned());
-    let focus = state_string(session, "recent_session_focus")
-        .or_else(|| state_string(session, "recent_innerworld_focus"))
-        .unwrap_or_else(|| "无".to_owned());
-    let scene = state_string(session, "active_scene").unwrap_or_else(|| "未明确".to_owned());
-    let mode = state_string(session, "expected_mode").unwrap_or_else(|| "未明确".to_owned());
-    let correction = state_string(session, "last_user_correction")
-        .or_else(|| state_string(session, "known_correction"))
-        .unwrap_or_else(|| "无".to_owned());
     format!(
-        "当前状态：\n- 话题：{topic}\n- 说话者提示：{speaker}\n- 最近焦点：{focus}\n- 场景：{scene}\n- 模式：{mode}\n- 最近修正：{correction}\n- 历史轮数：{}",
+        "当前状态：\n- 话题：{topic}\n- 历史轮数：{}",
         session.history.len()
     )
 }
@@ -424,6 +414,7 @@ pub(super) fn build_session_context(session: &SessionRecord) -> String {
     let state_rows = session
         .state
         .iter()
+        .filter(|(key, _)| !is_removed_chat_state_key(key))
         .filter_map(|(key, value)| value.as_str().map(|value| (key, value)))
         .filter(|(_, value)| !value.trim().is_empty())
         .map(|(key, value)| format!("{key}: {value}"))
@@ -443,4 +434,18 @@ pub(super) fn build_session_context(session: &SessionRecord) -> String {
             .to_owned(),
     );
     rows.join("\n\n")
+}
+
+fn is_removed_chat_state_key(key: &str) -> bool {
+    matches!(
+        key,
+        // 这些字段来自早期普通聊天的启发式状态推断，不再作为正式会话状态进入 Prompt。
+        "current_speaker_hint"
+            | "recent_session_focus"
+            | "recent_innerworld_focus"
+            | "active_scene"
+            | "expected_mode"
+            | "last_user_correction"
+            | "known_correction"
+    )
 }

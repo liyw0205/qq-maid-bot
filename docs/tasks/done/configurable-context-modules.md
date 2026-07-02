@@ -15,7 +15,7 @@ Planned
    * `mode_rules.md`
    * `session_context.md`
 2. `WORLD_FILE` 指向的可选世界观文件；
-3. `MEMBER_ID_MAPPING_FILE` 生成的成员编号映射提示；
+3. 旧成员映射配置 生成的旧成员映射提示；
 4. `llm_service.rs` 统一注入的请求时间上下文。
 
 另外，当前聊天链路还会在 system message 层追加：
@@ -31,7 +31,7 @@ Planned
 
 * 把“固定 prompt”“世界观文件”“成员映射提示”“session / memory / time 上下文”混成一类描述，容易误导实现范围；
 * 没有明确首版只改普通聊天链路，容易让人误以为 `/todo`、`/memory` 草稿、`/compact` 也要一起接入；
-* 目录和配置示例没有说明与 `PROMPT_DIR`、`WORLD_FILE`、`MEMBER_ID_MAPPING_FILE` 的关系；
+* 目录和配置示例没有说明与 `PROMPT_DIR`、`WORLD_FILE`、旧成员映射配置 的关系；
 * 与 `tasks/llm-rag-v1.md` 的边界不清，容易把“可配置 prompt 模块”做成半套知识库。
 
 因此，这里将任务重写为：**在保留当前 prompt 组装边界的前提下，为普通聊天链路增加一层确定性的、配置驱动的可选上下文模块加载能力。**
@@ -42,7 +42,7 @@ Planned
 
 * 固定行为规则：`PROMPT_DIR` 三个固定文件；
 * 可选世界观：`WORLD_FILE`；
-* 成员编号规则：`MEMBER_ID_MAPPING_FILE` 生成的系统提示；
+* 旧成员映射规则：旧成员映射配置 生成的系统提示；
 * 运行时上下文：时间、长期记忆、会话状态、最近历史消息。
 
 这种结构对小规模配置已经够用，但当部署方希望追加更多“只在某些话题下需要”的补充资料时，当前方案只有两个不理想的选择：
@@ -63,7 +63,7 @@ Planned
 
 V1 目标：
 
-1. 保留当前 `PROMPT_DIR`、`WORLD_FILE`、`MEMBER_ID_MAPPING_FILE` 语义不变；
+1. 保留当时 `PROMPT_DIR`、`WORLD_FILE` 语义；旧成员映射配置已在 #166 移除；
 2. 新增一层“可选上下文模块”，只在普通聊天链路中按需加载；
 3. 允许部署方把附加资料拆成多个独立 Markdown 模块维护；
 4. 使用简单、确定性的匹配规则决定本轮加载哪些模块；
@@ -84,7 +84,7 @@ V1 明确不做：
 * 多级模块依赖；
 * 概率触发、复杂规则引擎或模型判定选模块；
 * `/todo`、`/memory` 草稿、`/compact`、翻译、查询链路的上下文模块接入；
-* 替换现有 `WORLD_FILE` 或 `MEMBER_ID_MAPPING_FILE` 语义。
+* 替换现有 `WORLD_FILE` 语义；旧成员映射配置已在 #166 移除。
 
 如果需求已经接近“文档问答 / 本地知识库检索”，应看 `tasks/llm-rag-v1.md`，不要把本任务扩展成半套 RAG。
 
@@ -126,7 +126,7 @@ V1 只调整 `system_prompts` 这一层的内部来源顺序，建议变为：
 1. PROMPT_DIR 固定三文件
 2. WORLD_FILE（如配置）
 3. 命中的上下文模块
-4. MEMBER_ID_MAPPING_FILE 生成的成员编号映射提示
+4. 旧成员映射配置 生成的旧成员映射提示
 ```
 
 说明：
@@ -140,7 +140,7 @@ V1 只调整 `system_prompts` 这一层的内部来源顺序，建议变为：
 * 固定行为规则仍是最稳定的底层约束；
 * 世界观仍保留独立入口；
 * 可选模块只补充额外领域信息；
-* 成员编号规则仍作为靠后的显式约束出现，不被通用模块轻易覆盖。
+* 旧成员映射规则仍作为靠后的显式约束出现，不被通用模块轻易覆盖。
 
 ## 6. 配置入口与目录建议
 
@@ -155,7 +155,7 @@ CONTEXT_MODULES_FILE=
 * 留空：关闭该能力，完全保持当前行为；
 * 非空：指向模块索引文件。
 
-路径风格应与现有 `PROMPT_DIR`、`WORLD_FILE`、`MEMBER_ID_MAPPING_FILE` 保持一致：
+路径风格应与现有 `PROMPT_DIR`、`WORLD_FILE` 保持一致；旧成员映射配置已在 #166 移除：
 
 * 支持外部绝对路径；
 * 支持按 `runtime/` 工作目录解析的相对路径；
@@ -170,7 +170,7 @@ runtime/config/
 │   ├── mode_rules.md
 │   └── session_context.md
 ├── world.md
-├── member_id_mapping.json
+├── 旧成员映射文件
 ├── context_modules.example.toml
 ├── context_modules.toml
 └── context/
@@ -181,7 +181,7 @@ runtime/config/
 
 说明：
 
-* `PROMPT_DIR`、`WORLD_FILE`、`MEMBER_ID_MAPPING_FILE` 继续按现有方式工作；
+* `PROMPT_DIR`、`WORLD_FILE` 继续按现有方式工作；旧成员映射配置已在 #166 移除；
 * `context_modules.toml` 只是新增索引，不替代现有三种配置；
 * 真实模块内容默认仍应视为私有配置，不提交仓库；
 * `.example` 文件只提供公开示例，不进入运行时加载。
@@ -289,7 +289,7 @@ V1 保持简单、可预测：
 兼容要求：
 
 1. `CONTEXT_MODULES_FILE` 未配置时，`PromptConfig` 行为与当前版本完全一致；
-2. `PROMPT_DIR`、`WORLD_FILE`、`MEMBER_ID_MAPPING_FILE` 不改名、不降级、不迁移；
+2. `PROMPT_DIR`、`WORLD_FILE` 不改名、不降级、不迁移；旧成员映射配置已在 #166 移除；
 3. `WORLD_FILE` 与模块索引可以同时存在；
 4. 现有持久化数据、session scope、memory / todo 流程不受影响；
 5. 不新增对外 API 字段，不要求 gateway 传额外上下文。
@@ -403,7 +403,7 @@ make test
 
 建议至少覆盖：
 
-* 未配置模块索引时仍只加载原有固定 prompt / world / 成员映射；
+* 未配置模块索引时仍只加载原有固定 prompt / world；旧成员映射链路已在 #166 移除；
 * `always` 模块按顺序注入；
 * 关键词命中时加载动态模块；
 * 未命中时不加载；
