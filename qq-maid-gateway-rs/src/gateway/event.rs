@@ -505,12 +505,39 @@ fn input_parts_from_content_and_attachments(
     if parsed_parts.is_empty() && !content.trim().is_empty() {
         parts.push(MessageInputPart::text(content.to_owned()));
     }
-    parts.extend(parsed_parts);
-    parts.extend(
-        attachments
-            .iter()
-            .map(|attachment| attachment.to_input_part(platform)),
-    );
+    let mut image_attachments = attachments
+        .iter()
+        .filter(|attachment| {
+            attachment_kind(
+                attachment.content_type.as_deref(),
+                attachment.filename.as_deref(),
+            ) == AttachmentKind::Image
+        })
+        .cloned();
+    let mut trailing_parts = Vec::new();
+
+    for part in parsed_parts {
+        match part {
+            MessageInputPart::Image { .. } => {
+                if let Some(attachment) = image_attachments.next() {
+                    parts.push(attachment.to_input_part(platform));
+                } else {
+                    parts.push(part);
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+
+    trailing_parts.extend(image_attachments.map(|attachment| attachment.to_input_part(platform)));
+    trailing_parts.extend(attachments.iter().filter_map(|attachment| {
+        (attachment_kind(
+            attachment.content_type.as_deref(),
+            attachment.filename.as_deref(),
+        ) != AttachmentKind::Image)
+            .then(|| attachment.to_input_part(platform))
+    }));
+    parts.extend(trailing_parts);
     parts
 }
 
@@ -763,6 +790,58 @@ mod tests {
                     && media.status == MediaStatus::MissingReadableUrl
         ));
         assert_eq!(message.input_parts[1].text_content(), Some("抱抱你"));
+    }
+
+    #[test]
+    fn c2c_img_placeholders_reuse_attachment_slots_without_duplicates() {
+        let envelope = GatewayEnvelope {
+            op: 0,
+            s: Some(42),
+            t: Some(EVENT_C2C_MESSAGE_CREATE.to_owned()),
+            id: None,
+            d: json!({
+                "id": "msg-mixed-images",
+                "author": {"user_openid": "user-1"},
+                "content": r#"前<img src="file://C:\Images\a.png" />中<img src="file://C:\Images\b.webp" />后"#,
+                "attachments": [
+                    {
+                        "content_type": "image",
+                        "filename": "a.png",
+                        "url": "https://example.test/a.png"
+                    },
+                    {
+                        "content_type": "image/webp",
+                        "filename": "b.webp",
+                        "url": "https://example.test/b.webp"
+                    }
+                ]
+            }),
+        };
+
+        let message = parse_c2c_message(&envelope).unwrap().unwrap();
+
+        assert_eq!(message.input_parts.len(), 5);
+        assert_eq!(message.input_parts[0].text_content(), Some("前"));
+        assert_eq!(message.input_parts[2].text_content(), Some("中"));
+        assert_eq!(message.input_parts[4].text_content(), Some("后"));
+        assert_eq!(
+            message
+                .input_parts
+                .iter()
+                .filter(|part| matches!(part, MessageInputPart::Image { .. }))
+                .count(),
+            2
+        );
+        let MessageInputPart::Image { media: first } = &message.input_parts[1] else {
+            panic!("expected first image part");
+        };
+        let MessageInputPart::Image { media: second } = &message.input_parts[3] else {
+            panic!("expected second image part");
+        };
+        assert_eq!(first.remote_url(), Some("https://example.test/a.png"));
+        assert_eq!(first.mime_type.as_deref(), Some("image"));
+        assert_eq!(second.remote_url(), Some("https://example.test/b.webp"));
+        assert_eq!(second.mime_type.as_deref(), Some("image/webp"));
     }
 
     #[test]
