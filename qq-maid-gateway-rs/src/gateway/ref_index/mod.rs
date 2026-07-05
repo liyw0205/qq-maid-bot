@@ -391,6 +391,29 @@ mod tests {
         }
     }
 
+    fn group_inbound_from(
+        message_id: &str,
+        msg_idx: Option<&str>,
+        text: &str,
+        sender_id: &str,
+        is_bot: bool,
+    ) -> InboundMessage {
+        let mut message = group_inbound(message_id, msg_idx, text);
+        message.actor.sender_id = Some(sender_id.to_owned());
+        message.actor.is_bot = is_bot;
+        message
+    }
+
+    fn quoted_group_lookup(store: &RefIndex, ref_id: &str) -> QuotedMessageContext {
+        let mut current = group_inbound("gm-current", Some("REFIDX_current"), "查看引用");
+        current.quoted = Some(QuotedMessageContext {
+            ref_msg_idx: Some(ref_id.to_owned()),
+            ..Default::default()
+        });
+        store.enrich_inbound(&mut current);
+        current.quoted.unwrap()
+    }
+
     #[test]
     fn index_isolated_by_peer_and_fills_quote_context() {
         let mut store = RefIndex::default();
@@ -697,6 +720,62 @@ mod tests {
             quoted.input_parts[1],
             MessageInputPart::Image { .. }
         ));
+    }
+
+    #[test]
+    fn qq_group_ref_index_cross_quotes_exact_ref_id_without_latest_overwrite() {
+        let mut message_a =
+            group_inbound_from("gm-a", Some("REFIDX_A"), "内容 A", "member-a", false);
+        let mut message_b =
+            group_inbound_from("gm-b", Some("REFIDX_B"), "内容 B", "member-bot", true);
+        message_b
+            .input_parts
+            .push(MessageInputPart::image(MessageMedia {
+                mime_type: Some("image/png".to_owned()),
+                filename: Some("b.png".to_owned()),
+                url: Some("https://example.test/b.png".to_owned()),
+                ..Default::default()
+            }));
+
+        let mut store = RefIndex::default();
+        store.insert_inbound(&message_a);
+        store.insert_inbound(&message_b);
+
+        let quoted_a_first = quoted_group_lookup(&store, "REFIDX_A");
+        let quoted_b = quoted_group_lookup(&store, "REFIDX_B");
+        let quoted_a_again = quoted_group_lookup(&store, "REFIDX_A");
+
+        assert!(quoted_a_first.lookup_found);
+        assert_eq!(quoted_a_first.text_summary.as_deref(), Some("内容 A"));
+        assert_eq!(quoted_a_first.from_bot, Some(false));
+        assert!(quoted_a_first.media_summaries.is_empty());
+        assert_eq!(quoted_a_first.input_parts.len(), 1);
+        assert_eq!(quoted_a_first.input_parts[0].text_content(), Some("内容 A"));
+
+        assert!(quoted_b.lookup_found);
+        assert_eq!(quoted_b.text_summary.as_deref(), Some("内容 B"));
+        assert_eq!(quoted_b.from_bot, Some(true));
+        assert_eq!(quoted_b.media_summaries.len(), 1);
+        assert!(matches!(
+            quoted_b.input_parts[1],
+            MessageInputPart::Image { .. }
+        ));
+
+        assert!(quoted_a_again.lookup_found);
+        assert_eq!(quoted_a_again.text_summary.as_deref(), Some("内容 A"));
+        assert_eq!(quoted_a_again.from_bot, Some(false));
+        assert!(quoted_a_again.media_summaries.is_empty());
+        assert_eq!(quoted_a_again.input_parts.len(), 1);
+
+        message_a.actor.sender_id = Some("member-a-updated".to_owned());
+        store.insert_inbound(&message_a);
+        let quoted_b_after_a_update = quoted_group_lookup(&store, "REFIDX_B");
+        assert_eq!(
+            quoted_b_after_a_update.text_summary.as_deref(),
+            Some("内容 B")
+        );
+        assert_eq!(quoted_b_after_a_update.from_bot, Some(true));
+        assert_eq!(quoted_b_after_a_update.media_summaries.len(), 1);
     }
 
     #[test]

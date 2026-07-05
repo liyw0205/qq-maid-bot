@@ -17,7 +17,10 @@ use super::{
     cache::BotOutboundCache,
     dedupe::MessageDedupe,
     event::{GroupEventType, GroupMessage},
-    group_filter::{GroupCooldowns, should_ignore_group_message, should_process_group_message},
+    group_filter::{
+        GroupCooldowns, mentions_current_bot, should_ignore_group_message,
+        should_process_group_message,
+    },
     logging::{group_message_log_summary, mask_openid},
     media_fetch::{MediaFetchContext, fetch_qq_official_image_attachments},
     outbound::{
@@ -41,12 +44,12 @@ fn group_reply_mention_prefix(
     message: &GroupMessage,
     capability: &ReplyCapability,
 ) -> Option<String> {
-    // 只有用户显式 @ 机器人触发的官方群 at 事件，才在回复正文里 @ 回发起人；
+    // 只有官方确认提到当前机器人时，才在回复正文里 @ 回发起人；
     // 普通群命令、关键词触发和回复机器人消息继续只挂原消息 msg_id，避免额外打扰。
     if !capability.supports_at_mention {
         return None;
     }
-    if message.event_type != GroupEventType::GroupAtMessage {
+    if !mentions_current_bot(message) {
         return None;
     }
     message
@@ -773,6 +776,21 @@ mod tests {
             OutboundMessage::Text {
                 text: "<@member-1>\n回复正文".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn structured_group_mention_reply_mentions_sender_like_at_event() {
+        let mut message = group_message("hello", GroupEventType::GroupMessage);
+        message.mentions = vec![crate::gateway::event::GroupMention {
+            is_you: true,
+            member_role: None,
+        }];
+        let capability = qq_group_capability();
+
+        assert_eq!(
+            prefix_group_reply_text(&message, "回复正文", &capability),
+            "<@member-1>\n回复正文"
         );
     }
 
