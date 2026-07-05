@@ -283,7 +283,7 @@ pub(super) async fn handle_c2c_message(
     )
     .await;
 
-    let mut inbound = platform::qq_official::inbound_from_c2c(&message);
+    let mut inbound = respond.prepare_inbound(platform::qq_official::inbound_from_c2c(&message));
     {
         let mut index = ref_index.lock().unwrap();
         index.enrich_inbound(&mut inbound);

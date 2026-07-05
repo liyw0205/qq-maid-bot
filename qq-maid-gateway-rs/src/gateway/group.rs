@@ -113,7 +113,12 @@ pub(super) async fn handle_group_message(
     let masked_group = mask_openid(&message.group_openid);
     let respond_content =
         crate::respond::build_group_respond_content(&message, &config.group_active_keywords);
-    if should_ignore_group_message(&message, &respond_content, &masked_group) {
+    if should_ignore_group_message(
+        &message,
+        &respond_content,
+        &masked_group,
+        group_outbound_cache,
+    ) {
         return Ok(());
     }
     if dedupe.is_duplicate(&message.message_id) {
@@ -174,7 +179,7 @@ pub(super) async fn handle_group_message(
     )
     .await;
 
-    let mut inbound = platform::qq_official::inbound_from_group(&message);
+    let mut inbound = respond.prepare_inbound(platform::qq_official::inbound_from_group(&message));
     {
         let mut index = ref_index.lock().unwrap();
         index.enrich_inbound(&mut inbound);

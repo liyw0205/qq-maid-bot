@@ -233,7 +233,11 @@ impl RespondClient {
             .expect("QQ group inbound message should have a Core scope")
     }
 
-    fn prepare_inbound(&self, mut inbound: platform::InboundMessage) -> platform::InboundMessage {
+    /// 注入 gateway 级账号隔离字段，供 ref_index、调度 scope 和 Core request 复用。
+    pub(crate) fn prepare_inbound(
+        &self,
+        mut inbound: platform::InboundMessage,
+    ) -> platform::InboundMessage {
         if inbound.platform == platform::Platform::QqOfficial && inbound.account_id.is_none() {
             inbound.account_id = self.qq_official_account_id.clone();
         }
@@ -722,6 +726,28 @@ mod tests {
         let request = client.core_request_from_group_message(&group, "/rss".to_owned());
         assert_eq!(request.account_id.as_deref(), Some("app-123"));
         assert_eq!(request.actor.user_id.as_deref(), Some("member1"));
+    }
+
+    #[test]
+    fn prepare_inbound_injects_account_before_core_scope_mapping() {
+        let client = RespondClient::new(Arc::new(NoopCore)).with_qq_official_account_id("app-123");
+        let c2c = client.prepare_inbound(platform::qq_official::inbound_from_c2c(&c2c_message(
+            "你好",
+        )));
+        let group = client.prepare_inbound(platform::qq_official::inbound_from_group(
+            &group_message("/rss", Some("member1")),
+        ));
+
+        assert_eq!(c2c.account_id.as_deref(), Some("app-123"));
+        assert_eq!(
+            platform::core_scope_key(&c2c).unwrap(),
+            "platform:qq_official:account:app-123:private:u1"
+        );
+        assert_eq!(group.account_id.as_deref(), Some("app-123"));
+        assert_eq!(
+            platform::core_scope_key(&group).unwrap(),
+            "platform:qq_official:account:app-123:group:g1"
+        );
     }
 
     #[test]

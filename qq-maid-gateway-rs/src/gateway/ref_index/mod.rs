@@ -239,6 +239,21 @@ mod tests {
         }
     }
 
+    fn group_inbound(message_id: &str, msg_idx: Option<&str>, text: &str) -> InboundMessage {
+        InboundMessage {
+            conversation: ConversationTarget::Group {
+                target_id: "group-1".to_owned(),
+            },
+            actor: super::super::platform::Actor {
+                sender_id: Some("member-1".to_owned()),
+                display_name: None,
+                group_member_role: None,
+                is_bot: false,
+            },
+            ..inbound(message_id, msg_idx, text)
+        }
+    }
+
     #[test]
     fn index_isolated_by_peer_and_fills_quote_context() {
         let mut store = RefIndex::default();
@@ -302,5 +317,71 @@ mod tests {
         let quoted = current.quoted.unwrap();
         assert!(!quoted.lookup_found);
         assert_eq!(quoted.fallback_reason.as_deref(), Some("ref_index_miss"));
+    }
+
+    #[test]
+    fn outbound_and_inbound_lookup_share_app_id_for_private_and_group() {
+        let mut store = RefIndex::default();
+        store.insert_bot_outbound(
+            super::super::platform::Platform::QqOfficial,
+            Some("app"),
+            &ConversationTarget::Private {
+                target_id: "user-1".to_owned(),
+            },
+            Some("bot-private-1".to_owned()),
+            "私聊回复",
+        );
+        store.insert_bot_outbound(
+            super::super::platform::Platform::QqOfficial,
+            Some("app"),
+            &ConversationTarget::Group {
+                target_id: "group-1".to_owned(),
+            },
+            Some("bot-group-1".to_owned()),
+            "群聊回复",
+        );
+
+        let mut private_current = inbound("m2", None, "继续");
+        private_current.quoted = Some(QuotedMessageContext {
+            ref_msg_idx: Some("bot-private-1".to_owned()),
+            ..Default::default()
+        });
+        let mut group_current = group_inbound("gm2", None, "继续");
+        group_current.quoted = Some(QuotedMessageContext {
+            ref_msg_idx: Some("bot-group-1".to_owned()),
+            ..Default::default()
+        });
+        let mut missing_account = inbound("m3", None, "继续");
+        missing_account.account_id = None;
+        missing_account.quoted = Some(QuotedMessageContext {
+            ref_msg_idx: Some("bot-private-1".to_owned()),
+            ..Default::default()
+        });
+
+        store.enrich_inbound(&mut private_current);
+        store.enrich_inbound(&mut group_current);
+        store.enrich_inbound(&mut missing_account);
+
+        assert!(private_current.quoted.as_ref().unwrap().lookup_found);
+        assert_eq!(
+            private_current
+                .quoted
+                .as_ref()
+                .unwrap()
+                .text_summary
+                .as_deref(),
+            Some("私聊回复")
+        );
+        assert!(group_current.quoted.as_ref().unwrap().lookup_found);
+        assert_eq!(
+            group_current
+                .quoted
+                .as_ref()
+                .unwrap()
+                .text_summary
+                .as_deref(),
+            Some("群聊回复")
+        );
+        assert!(!missing_account.quoted.as_ref().unwrap().lookup_found);
     }
 }
