@@ -10,13 +10,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use qq_maid_common::input_part::{MessageInputPart, QuotedMediaSummary};
+use qq_maid_common::input_part::{MediaStatus, MessageInputPart, MessageMedia, QuotedMediaSummary};
 
 use super::platform::{ConversationTarget, InboundMessage};
 
 pub(crate) type SharedRefIndex = Arc<Mutex<RefIndex>>;
 
 const MAX_REF_ENTRIES: usize = 4096;
+const MAX_REF_TEXT_SUMMARY_CHARS: usize = 2000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RefIndexKey {
@@ -62,12 +63,12 @@ impl RefIndex {
             return;
         };
         let entry = RefIndexEntry {
-            text_summary: clean_optional(Some(text.to_owned())),
+            text_summary: clean_summary(Some(text.to_owned())),
             media_summaries: Vec::new(),
             input_parts: if text.trim().is_empty() {
                 Vec::new()
             } else {
-                vec![MessageInputPart::text(text.to_owned())]
+                vec![MessageInputPart::text(truncate_summary_text(text))]
             },
             from_bot: true,
             timestamp: None,
@@ -153,7 +154,7 @@ fn ref_ids_for_current_message(inbound: &InboundMessage) -> Vec<String> {
 }
 
 fn entry_from_inbound(inbound: &InboundMessage) -> RefIndexEntry {
-    let text_summary = clean_optional(Some(inbound.text.clone()));
+    let text_summary = clean_summary(Some(inbound.text.clone()));
     let input_parts = effective_index_parts(inbound);
     let media_summaries = input_parts
         .iter()
@@ -170,11 +171,11 @@ fn entry_from_inbound(inbound: &InboundMessage) -> RefIndexEntry {
 
 fn effective_index_parts(inbound: &InboundMessage) -> Vec<MessageInputPart> {
     if !inbound.input_parts.is_empty() {
-        return inbound.input_parts.clone();
+        return sanitize_index_parts(inbound.input_parts.clone());
     }
     let mut parts = Vec::new();
     if !inbound.text.trim().is_empty() {
-        parts.push(MessageInputPart::text(inbound.text.clone()));
+        parts.push(MessageInputPart::text(truncate_summary_text(&inbound.text)));
     }
     parts.extend(
         inbound
@@ -182,7 +183,7 @@ fn effective_index_parts(inbound: &InboundMessage) -> Vec<MessageInputPart> {
             .iter()
             .map(|attachment| attachment.to_input_part(inbound.platform)),
     );
-    parts
+    sanitize_index_parts(parts)
 }
 
 fn key_for(
@@ -208,6 +209,66 @@ fn clean_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+fn clean_summary(value: Option<String>) -> Option<String> {
+    clean_optional(value).map(|value| truncate_summary_text(&value))
+}
+
+fn truncate_summary_text(value: &str) -> String {
+    let trimmed = value.trim();
+    let char_count = trimmed.chars().count();
+    if char_count <= MAX_REF_TEXT_SUMMARY_CHARS {
+        return trimmed.to_owned();
+    }
+    let mut output = trimmed
+        .chars()
+        .take(MAX_REF_TEXT_SUMMARY_CHARS)
+        .collect::<String>();
+    output.push_str("...");
+    output
+}
+
+fn sanitize_index_parts(parts: Vec<MessageInputPart>) -> Vec<MessageInputPart> {
+    parts.into_iter().map(sanitize_index_part).collect()
+}
+
+fn sanitize_index_part(part: MessageInputPart) -> MessageInputPart {
+    match part {
+        MessageInputPart::Text { text, source } => MessageInputPart::Text {
+            text: truncate_summary_text(&text),
+            source,
+        },
+        MessageInputPart::Image { media } => MessageInputPart::Image {
+            media: sanitize_index_media(media),
+        },
+        MessageInputPart::File { media } => MessageInputPart::File {
+            media: sanitize_index_media(media),
+        },
+        MessageInputPart::Unknown { media, reason } => MessageInputPart::Unknown {
+            media: sanitize_index_media(media),
+            reason,
+        },
+    }
+}
+
+fn sanitize_index_media(mut media: MessageMedia) -> MessageMedia {
+    // ref_index 只保存轻量引用元信息。data URL 可能携带 base64 内容，不能进入内存索引。
+    if media
+        .url
+        .as_deref()
+        .is_some_and(|value| value.trim_start().to_ascii_lowercase().starts_with("data:"))
+    {
+        media.url = None;
+        if media
+            .local_path
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            media.status = MediaStatus::MissingReadableUrl;
+        }
+    }
+    media
 }
 
 #[cfg(test)]
@@ -304,6 +365,37 @@ mod tests {
     }
 
     #[test]
+    fn index_drops_data_url_and_keeps_only_lightweight_media_reference() {
+        let mut message = inbound("m1", Some("REFIDX_1"), "看图");
+        message
+            .input_parts
+            .push(MessageInputPart::image(MessageMedia {
+                mime_type: Some("image/png".to_owned()),
+                filename: Some("a.png".to_owned()),
+                url: Some("data:image/png;base64,AAAA".to_owned()),
+                local_path: Some("/tmp/qq-maid/a.png".to_owned()),
+                ..Default::default()
+            }));
+        let mut store = RefIndex::default();
+        store.insert_inbound(&message);
+        let mut current = inbound("m2", None, "继续");
+        current.quoted = Some(QuotedMessageContext {
+            ref_msg_idx: Some("REFIDX_1".to_owned()),
+            ..Default::default()
+        });
+
+        store.enrich_inbound(&mut current);
+
+        let quoted = current.quoted.unwrap();
+        let MessageInputPart::Image { media } = &quoted.input_parts[1] else {
+            panic!("expected image part");
+        };
+        assert_eq!(media.url, None);
+        assert_eq!(media.local_path.as_deref(), Some("/tmp/qq-maid/a.png"));
+        assert_eq!(quoted.media_summaries[0].media.as_ref().unwrap().url, None);
+    }
+
+    #[test]
     fn missing_quote_records_fallback_reason() {
         let store = RefIndex::default();
         let mut current = inbound("m2", None, "继续");
@@ -383,5 +475,47 @@ mod tests {
             Some("群聊回复")
         );
         assert!(!missing_account.quoted.as_ref().unwrap().lookup_found);
+    }
+
+    #[test]
+    fn evicts_oldest_entries_after_capacity_limit() {
+        let mut store = RefIndex::default();
+        let conversation = ConversationTarget::Private {
+            target_id: "user-1".to_owned(),
+        };
+        for index in 0..=MAX_REF_ENTRIES {
+            store.insert_bot_outbound(
+                super::super::platform::Platform::QqOfficial,
+                Some("app"),
+                &conversation,
+                Some(format!("bot-{index}")),
+                &format!("回复 {index}"),
+            );
+        }
+
+        assert!(store.entries.len() <= MAX_REF_ENTRIES);
+
+        let mut oldest = inbound("m-oldest", None, "继续");
+        oldest.quoted = Some(QuotedMessageContext {
+            ref_msg_idx: Some("bot-0".to_owned()),
+            ..Default::default()
+        });
+        let latest_ref = format!("bot-{MAX_REF_ENTRIES}");
+        let latest_text = format!("回复 {MAX_REF_ENTRIES}");
+        let mut latest = inbound("m-latest", None, "继续");
+        latest.quoted = Some(QuotedMessageContext {
+            ref_msg_idx: Some(latest_ref),
+            ..Default::default()
+        });
+
+        store.enrich_inbound(&mut oldest);
+        store.enrich_inbound(&mut latest);
+
+        assert!(!oldest.quoted.as_ref().unwrap().lookup_found);
+        assert!(latest.quoted.as_ref().unwrap().lookup_found);
+        assert_eq!(
+            latest.quoted.as_ref().unwrap().text_summary.as_deref(),
+            Some(latest_text.as_str())
+        );
     }
 }

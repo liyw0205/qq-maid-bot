@@ -419,7 +419,10 @@ mod tests {
         DEFAULT_MESSAGE_AGGREGATION_QUIET_MS, DEFAULT_TEXT_CHUNK_SOFT_LIMIT, GroupMessageMode,
         MessageAggregationConfig,
     };
-    use crate::{api::QqApiClient, auth::AccessTokenManager};
+    use crate::{
+        api::{ApiError, QqApiClient},
+        auth::AccessTokenManager,
+    };
     use axum::{Router, body::Bytes, routing::get};
     use qq_maid_common::input_part::{MessageInputPart, MessageMedia};
     use qq_maid_core::service::{
@@ -559,6 +562,16 @@ mod tests {
         )
     }
 
+    fn assert_group_send_error(err: anyhow::Error) {
+        assert!(
+            matches!(
+                err.downcast_ref::<ApiError>(),
+                Some(ApiError::Auth(_) | ApiError::Http(_) | ApiError::Status { .. })
+            ),
+            "expected QQ send/auth error from fake API endpoint, got: {err:#}"
+        );
+    }
+
     fn bot_identity() -> SharedBotIdentity {
         Arc::new(crate::gateway::bot_identity::BotIdentity::new("app", &[]))
     }
@@ -592,6 +605,17 @@ mod tests {
             }),
         ];
         message
+    }
+
+    fn unique_media_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "qq-maid-group-{name}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     fn media_file_count(root: &std::path::Path) -> usize {
@@ -721,13 +745,12 @@ mod tests {
     async fn mode_policy_blocked_group_message_does_not_download_media() {
         let mut config = test_config();
         config.group_message_mode = GroupMessageMode::Off;
-        config.media_dir =
-            std::env::temp_dir().join(format!("qq-maid-group-mode-policy-{}", std::process::id()));
+        config.media_dir = unique_media_dir("mode-policy");
         let (url, hits) = spawn_media_server().await;
         let message = media_message("group-off", "普通聊天", GroupEventType::GroupMessage, url);
         let ref_index = crate::gateway::ref_index::ref_index();
 
-        let _ = handle_group_message(
+        handle_group_message(
             message,
             &config,
             &respond_client(),
@@ -739,7 +762,8 @@ mod tests {
             &GatewayRuntimeStatus::new(),
             &ref_index,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         assert_eq!(media_file_count(&config.media_dir), 0);
@@ -749,8 +773,7 @@ mod tests {
     async fn cooldown_and_dedupe_blocked_group_messages_do_not_download_media() {
         let mut config = test_config();
         config.group_message_mode = GroupMessageMode::Active;
-        config.media_dir =
-            std::env::temp_dir().join(format!("qq-maid-group-cooldown-{}", std::process::id()));
+        config.media_dir = unique_media_dir("cooldown");
         let outbound_cache = Arc::new(Mutex::new(BotOutboundCache::default()));
         let cooldowns = Arc::new(Mutex::new(GroupCooldowns::default()));
         let dedupe = crate::gateway::dedupe::MessageDedupe::new(Duration::from_secs(60));
@@ -761,7 +784,7 @@ mod tests {
         let ref_index = crate::gateway::ref_index::ref_index();
 
         let (url_first, hits_first) = spawn_media_server().await;
-        let _ = handle_group_message(
+        let first_err = handle_group_message(
             media_message(
                 "group-cooldown-1",
                 "小女仆 看图",
@@ -778,12 +801,14 @@ mod tests {
             &runtime,
             &ref_index,
         )
-        .await;
+        .await
+        .unwrap_err();
+        assert_group_send_error(first_err);
 
         assert_eq!(hits_first.load(Ordering::SeqCst), 1);
 
         let (url_second, hits_second) = spawn_media_server().await;
-        let _ = handle_group_message(
+        handle_group_message(
             media_message(
                 "group-cooldown-2",
                 "小女仆 再看一次",
@@ -800,12 +825,13 @@ mod tests {
             &runtime,
             &ref_index,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(hits_second.load(Ordering::SeqCst), 0);
 
         let (url_third, hits_third) = spawn_media_server().await;
-        let _ = handle_group_message(
+        handle_group_message(
             media_message(
                 "group-cooldown-1",
                 "小女仆 重复消息",
@@ -822,7 +848,8 @@ mod tests {
             &runtime,
             &ref_index,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(hits_third.load(Ordering::SeqCst), 0);
     }
@@ -831,8 +858,7 @@ mod tests {
     async fn processed_group_message_downloads_media_after_filters() {
         let mut config = test_config();
         config.group_message_mode = GroupMessageMode::Active;
-        config.media_dir =
-            std::env::temp_dir().join(format!("qq-maid-group-download-{}", std::process::id()));
+        config.media_dir = unique_media_dir("download");
         let (url, hits) = spawn_media_server().await;
         let message = media_message(
             "group-download",
@@ -842,7 +868,7 @@ mod tests {
         );
         let ref_index = crate::gateway::ref_index::ref_index();
 
-        let _ = handle_group_message(
+        let err = handle_group_message(
             message,
             &config,
             &respond_client(),
@@ -854,7 +880,9 @@ mod tests {
             &GatewayRuntimeStatus::new(),
             &ref_index,
         )
-        .await;
+        .await
+        .unwrap_err();
+        assert_group_send_error(err);
 
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(media_file_count(&config.media_dir), 1);
