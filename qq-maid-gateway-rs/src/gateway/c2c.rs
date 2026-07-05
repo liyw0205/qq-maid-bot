@@ -8,7 +8,6 @@ use std::{future::Future, pin::Pin};
 use tracing::{debug, info, warn};
 
 use super::{
-    cache::{ReplyCache, resolve_signals},
     dedupe::MessageDedupe,
     event::C2cMessage,
     logging::{c2c_message_log_summary, mask_openid},
@@ -21,6 +20,8 @@ use super::{
         GatewayRuntimeStatus, build_c2c_ping_reply_with_check_failure, is_ping_check_command,
         is_ping_command,
     },
+    platform,
+    ref_index::SharedRefIndex,
     stream::stream_respond_c2c,
     typing::{C2cTypingStatusGuard, TypingStopReason},
 };
@@ -41,6 +42,7 @@ use qq_maid_core::service::{
 };
 
 const CORE_STREAM_CLOSED_FALLBACK_TEXT: &str = "处理失败，请稍后再试。";
+const EMPTY_REPLY_FALLBACK_TEXT: &str = "唔，小女仆刚刚没整理出可用回复。可以再说一次。";
 
 type RespondEventFuture<'a> = Pin<Box<dyn Future<Output = Option<RespondEvent>> + Send + 'a>>;
 
@@ -73,13 +75,33 @@ async fn send_c2c_respond_response(
     message: &C2cMessage,
     response: &RespondResponse,
     config: &AppConfig,
+    ref_index: &SharedRefIndex,
 ) -> anyhow::Result<()> {
     let sender = RuntimeRecordingSender {
         inner: api,
         runtime,
     };
     let capability = ReplyCapability::qq_official_c2c(config);
-    send_c2c_respond_response_with_sender(&sender, message, response, config, &capability).await
+    let sent_ids =
+        send_c2c_respond_response_with_sender(&sender, message, response, config, &capability)
+            .await?;
+    let inbound = platform::qq_official::inbound_from_c2c(message);
+    let text = response
+        .markdown
+        .as_deref()
+        .or(response.text.as_deref())
+        .unwrap_or("");
+    let mut index = ref_index.lock().unwrap();
+    for sent_id in sent_ids.into_iter().flatten() {
+        index.insert_bot_outbound(
+            platform::Platform::QqOfficial,
+            Some(&config.app_id),
+            &inbound.conversation,
+            Some(sent_id),
+            text,
+        );
+    }
+    Ok(())
 }
 
 /// 普通 C2C 回复发送的共享实现。
@@ -92,15 +114,21 @@ pub(super) async fn send_c2c_respond_response_with_sender<S: OutboundSender + ?S
     response: &RespondResponse,
     config: &AppConfig,
     capability: &ReplyCapability,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<Option<String>>> {
     let masked_user = mask_openid(&message.user_openid);
-    let Some(outbound) = render_respond_response_for_profile(response, &capability.render) else {
-        debug!(
+    let outbound = match render_respond_response_for_profile(response, &capability.render) {
+        Some(outbound) => outbound,
+        None => {
+            warn!(
             message_id = %message.message_id,
             user = %masked_user,
-            "respond backend produced no reply text"
-        );
-        return Ok(());
+            fallback_reason = "empty_rendered_response",
+            "respond backend produced no reply text; sending local fallback"
+            );
+            OutboundMessage::Text {
+                text: EMPTY_REPLY_FALLBACK_TEXT.to_owned(),
+            }
+        }
     };
 
     let target = ReplyTarget::qq_c2c(
@@ -121,7 +149,7 @@ pub(super) async fn send_c2c_respond_response_with_sender<S: OutboundSender + ?S
     );
     // 普通回复统一走分段编排：长回复拆成多条逐段发送，段间失败返回 PartiallySent。
     match send_c2c_outbound_chunked(sender, &target, &outbound, &limits, |_, _| {}).await {
-        Ok(_) => Ok(()),
+        Ok(sent_ids) => Ok(sent_ids),
         Err(OutboundSendError::NotSent { source }) => {
             warn!(
                 message_id = target.msg_id.as_deref().unwrap_or(""),
@@ -162,17 +190,19 @@ pub(super) async fn handle_c2c_message(
     respond: &RespondClient,
     api: &QqApiClient,
     _dedupe: &MessageDedupe,
-    reply_cache: &ReplyCache,
+    ref_index: &SharedRefIndex,
     runtime: &GatewayRuntimeStatus,
 ) -> anyhow::Result<()> {
-    // Ingress 已完成解析；这里固定先走 Signal Layer，再进入 Egress content 构建。
-    resolve_signals(&mut message, reply_cache);
     log_c2c_message_received(&message, config.verbose_log);
     runtime.record_c2c_message_received(&message);
 
     let masked_user = mask_openid(&message.user_openid);
     let respond_content = build_respond_content(&message);
-    if respond_content.trim().is_empty() {
+    if respond_content.trim().is_empty()
+        && message.reply.is_none()
+        && message.input_parts.is_empty()
+        && message.attachments.is_empty()
+    {
         debug!(
             message_id = %message.message_id,
             user = %masked_user,
@@ -253,6 +283,13 @@ pub(super) async fn handle_c2c_message(
     )
     .await;
 
+    let mut inbound = platform::qq_official::inbound_from_c2c(&message);
+    {
+        let mut index = ref_index.lock().unwrap();
+        index.enrich_inbound(&mut inbound);
+        index.insert_inbound(&inbound);
+    }
+
     info!(
         message_id = %message.message_id,
         user = %masked_user,
@@ -263,10 +300,11 @@ pub(super) async fn handle_c2c_message(
         respond,
         api.clone(),
         &message,
+        &inbound,
         respond_content.clone(),
     )
     .await;
-    let transport = match respond.respond_c2c(&message, respond_content).await {
+    let transport = match respond.respond_inbound(&inbound, respond_content).await {
         Ok(response) => {
             runtime.record_respond_success();
             response
@@ -310,7 +348,7 @@ pub(super) async fn handle_c2c_message(
     match transport {
         RespondTransport::Complete(response) => {
             stop_typing(&mut typing, TypingStopReason::FinalReply);
-            send_c2c_respond_response(api, runtime, &message, &response, config).await?;
+            send_c2c_respond_response(api, runtime, &message, &response, config, ref_index).await?;
         }
         RespondTransport::Stream(stream) => {
             let capability = ReplyCapability::qq_official_c2c(config);
@@ -343,12 +381,13 @@ async fn schedule_agent_typing_if_needed(
     respond: &RespondClient,
     api: QqApiClient,
     message: &C2cMessage,
+    inbound: &platform::InboundMessage,
     respond_content: String,
 ) -> Option<C2cTypingStatusGuard> {
     if !config.agent_typing.enabled {
         return None;
     }
-    match respond.classify_c2c(message, respond_content).await {
+    match respond.classify_inbound(inbound, respond_content).await {
         Ok(classification) if classification.kind == CoreInboundKind::NormalChat => {
             C2cTypingStatusGuard::schedule(&config.agent_typing, api, message, "c2c")
         }
@@ -702,6 +741,7 @@ mod tests {
     fn c2c_message() -> C2cMessage {
         C2cMessage {
             message_id: "msg-1".to_owned(),
+            current_msg_idx: None,
             event_id: Some("event-1".to_owned()),
             source_message_ids: vec!["msg-1".to_owned()],
             source_event_ids: vec!["event-1".to_owned()],

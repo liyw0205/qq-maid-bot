@@ -499,7 +499,10 @@ mod tests {
     };
     use futures_util::stream;
     use qq_maid_common::input_part::MessageInputPart;
-    use std::time::Instant;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tokio::net::TcpListener;
 
     fn media_file_count(root: &std::path::Path) -> usize {
@@ -656,26 +659,32 @@ mod tests {
 
     #[tokio::test]
     async fn downloads_multiple_image_attachments_concurrently() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let handler = |body: &'static [u8],
+                       active: Arc<AtomicUsize>,
+                       max_active: Arc<AtomicUsize>| async move {
+            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(now_active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            active.fetch_sub(1, Ordering::SeqCst);
+            (
+                [(reqwest::header::CONTENT_TYPE.as_str(), "image/jpeg")],
+                Bytes::from_static(body),
+            )
+        };
+        let active_a = active.clone();
+        let max_active_a = max_active.clone();
+        let active_b = active.clone();
+        let max_active_b = max_active.clone();
         let app = Router::new()
             .route(
                 "/a.jpg",
-                get(|| async {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    (
-                        [(reqwest::header::CONTENT_TYPE.as_str(), "image/jpeg")],
-                        Bytes::from_static(b"a"),
-                    )
-                }),
+                get(move || handler(b"a", active_a.clone(), max_active_a.clone())),
             )
             .route(
                 "/b.jpg",
-                get(|| async {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    (
-                        [(reqwest::header::CONTENT_TYPE.as_str(), "image/jpeg")],
-                        Bytes::from_static(b"b"),
-                    )
-                }),
+                get(move || handler(b"b", active_b.clone(), max_active_b.clone())),
             );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -719,7 +728,6 @@ mod tests {
             max_bytes: 10 * 1024 * 1024,
         };
 
-        let started = Instant::now();
         fetch_qq_official_image_attachments(
             &reqwest::Client::new(),
             &context,
@@ -730,7 +738,7 @@ mod tests {
         .await;
 
         assert!(
-            started.elapsed() < Duration::from_millis(350),
+            max_active.load(Ordering::SeqCst) >= 2,
             "downloads should overlap instead of running sequentially"
         );
         assert!(parts.iter().all(|part| matches!(

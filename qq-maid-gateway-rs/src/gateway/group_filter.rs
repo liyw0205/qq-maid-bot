@@ -194,6 +194,7 @@ mod tests {
     fn group_message(content: &str, event_type: GroupEventType) -> GroupMessage {
         GroupMessage {
             message_id: "group-msg-1".to_owned(),
+            current_msg_idx: None,
             group_openid: "group-1".to_owned(),
             member_openid: Some("member-1".to_owned()),
             member_role: None,
@@ -521,6 +522,7 @@ mod tests {
         let mut message = group_message("继续", GroupEventType::GroupMessage);
         message.reply = Some(MessageReply {
             message_id: "bot-msg-1".to_owned(),
+            ref_msg_idx: None,
             content: None,
         });
 

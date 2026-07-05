@@ -10,6 +10,8 @@ use std::{
 
 use tracing::{debug, info, warn};
 
+const EMPTY_GROUP_REPLY_FALLBACK_TEXT: &str = "唔，小女仆刚刚没整理出可用回复。可以再说一次。";
+
 use super::{
     bot_identity::SharedBotIdentity,
     cache::BotOutboundCache,
@@ -22,6 +24,8 @@ use super::{
         ReplyCapability, ReplyTarget, RuntimeRecordingGroupSender, send_group_text_with_status,
     },
     ping::GatewayRuntimeStatus,
+    platform,
+    ref_index::SharedRefIndex,
 };
 use crate::{
     api::QqApiClient,
@@ -103,6 +107,7 @@ pub(super) async fn handle_group_message(
     group_cooldowns: &Arc<Mutex<GroupCooldowns>>,
     bot_identity: &SharedBotIdentity,
     runtime: &GatewayRuntimeStatus,
+    ref_index: &SharedRefIndex,
 ) -> anyhow::Result<()> {
     log_group_message_received(&message, config.verbose_log);
     let masked_group = mask_openid(&message.group_openid);
@@ -169,12 +174,19 @@ pub(super) async fn handle_group_message(
     )
     .await;
 
+    let mut inbound = platform::qq_official::inbound_from_group(&message);
+    {
+        let mut index = ref_index.lock().unwrap();
+        index.enrich_inbound(&mut inbound);
+        index.insert_inbound(&inbound);
+    }
+
     info!(
         message_id = %message.message_id,
         group = %masked_group,
         "calling respond backend for group"
     );
-    let transport = match respond.respond_group(&message, respond_content).await {
+    let transport = match respond.respond_inbound(&inbound, respond_content).await {
         Ok(response) => {
             runtime.record_respond_success();
             response
@@ -214,6 +226,7 @@ pub(super) async fn handle_group_message(
                 group_outbound_cache,
                 &message,
                 &response,
+                ref_index,
             )
             .await?;
         }
@@ -226,6 +239,7 @@ pub(super) async fn handle_group_message(
                     group_outbound_cache,
                     &message,
                     &response,
+                    ref_index,
                 )
                 .await?;
             }
@@ -241,15 +255,22 @@ async fn send_group_respond_response(
     group_outbound_cache: &Arc<Mutex<BotOutboundCache>>,
     message: &GroupMessage,
     response: &RespondResponse,
+    ref_index: &SharedRefIndex,
 ) -> anyhow::Result<()> {
     let capability = ReplyCapability::qq_official_group(config);
-    let Some(outbound) = render_respond_response_for_profile(response, &capability.render) else {
-        debug!(
+    let outbound = match render_respond_response_for_profile(response, &capability.render) {
+        Some(outbound) => outbound,
+        None => {
+            warn!(
             message_id = %message.message_id,
             group = %mask_openid(&message.group_openid),
-            "respond backend produced no group reply text"
-        );
-        return Ok(());
+            fallback_reason = "empty_rendered_response",
+            "respond backend produced no group reply text; sending local fallback"
+            );
+            OutboundMessage::Text {
+                text: EMPTY_GROUP_REPLY_FALLBACK_TEXT.to_owned(),
+            }
+        }
     };
     let outbound = prefix_group_reply_outbound(message, outbound, &capability);
     let sender = RuntimeRecordingGroupSender {
@@ -278,6 +299,19 @@ async fn send_group_respond_response(
                 .lock()
                 .unwrap()
                 .insert(sent_message_id.clone());
+            let inbound = platform::qq_official::inbound_from_group(message);
+            let text = response
+                .markdown
+                .as_deref()
+                .or(response.text.as_deref())
+                .unwrap_or("");
+            ref_index.lock().unwrap().insert_bot_outbound(
+                platform::Platform::QqOfficial,
+                Some(&config.app_id),
+                &inbound.conversation,
+                sent_message_id.clone(),
+                text,
+            );
         },
     )
     .await
@@ -397,6 +431,7 @@ mod tests {
     fn group_message(content: &str, event_type: GroupEventType) -> GroupMessage {
         GroupMessage {
             message_id: "group-msg-1".to_owned(),
+            current_msg_idx: None,
             group_openid: "group-1".to_owned(),
             member_openid: Some("member-1".to_owned()),
             member_role: None,
@@ -685,8 +720,9 @@ mod tests {
             std::env::temp_dir().join(format!("qq-maid-group-mode-policy-{}", std::process::id()));
         let (url, hits) = spawn_media_server().await;
         let message = media_message("group-off", "普通聊天", GroupEventType::GroupMessage, url);
+        let ref_index = crate::gateway::ref_index::ref_index();
 
-        handle_group_message(
+        let _ = handle_group_message(
             message,
             &config,
             &respond_client(),
@@ -696,9 +732,9 @@ mod tests {
             &Arc::new(Mutex::new(GroupCooldowns::default())),
             &bot_identity(),
             &GatewayRuntimeStatus::new(),
+            &ref_index,
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         assert_eq!(media_file_count(&config.media_dir), 0);
@@ -717,9 +753,10 @@ mod tests {
         let api = api_client();
         let runtime = GatewayRuntimeStatus::new();
         let identity = bot_identity();
+        let ref_index = crate::gateway::ref_index::ref_index();
 
         let (url_first, hits_first) = spawn_media_server().await;
-        handle_group_message(
+        let _ = handle_group_message(
             media_message(
                 "group-cooldown-1",
                 "小女仆 看图",
@@ -734,13 +771,14 @@ mod tests {
             &cooldowns,
             &identity,
             &runtime,
+            &ref_index,
         )
-        .await
-        .unwrap();
+        .await;
+
         assert_eq!(hits_first.load(Ordering::SeqCst), 1);
 
         let (url_second, hits_second) = spawn_media_server().await;
-        handle_group_message(
+        let _ = handle_group_message(
             media_message(
                 "group-cooldown-2",
                 "小女仆 再看一次",
@@ -755,13 +793,14 @@ mod tests {
             &cooldowns,
             &identity,
             &runtime,
+            &ref_index,
         )
-        .await
-        .unwrap();
+        .await;
+
         assert_eq!(hits_second.load(Ordering::SeqCst), 0);
 
         let (url_third, hits_third) = spawn_media_server().await;
-        handle_group_message(
+        let _ = handle_group_message(
             media_message(
                 "group-cooldown-1",
                 "小女仆 重复消息",
@@ -776,9 +815,10 @@ mod tests {
             &cooldowns,
             &identity,
             &runtime,
+            &ref_index,
         )
-        .await
-        .unwrap();
+        .await;
+
         assert_eq!(hits_third.load(Ordering::SeqCst), 0);
     }
 
@@ -795,8 +835,9 @@ mod tests {
             GroupEventType::GroupMessage,
             url,
         );
+        let ref_index = crate::gateway::ref_index::ref_index();
 
-        handle_group_message(
+        let _ = handle_group_message(
             message,
             &config,
             &respond_client(),
@@ -806,9 +847,9 @@ mod tests {
             &Arc::new(Mutex::new(GroupCooldowns::default())),
             &bot_identity(),
             &GatewayRuntimeStatus::new(),
+            &ref_index,
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(media_file_count(&config.media_dir), 1);
