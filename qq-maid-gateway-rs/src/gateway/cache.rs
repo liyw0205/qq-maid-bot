@@ -7,6 +7,7 @@ use std::collections::HashSet;
 #[derive(Debug, Default)]
 pub(crate) struct BotOutboundCache {
     message_ids: HashSet<String>,
+    ref_index_ids: HashSet<String>,
 }
 
 impl BotOutboundCache {
@@ -16,7 +17,17 @@ impl BotOutboundCache {
         }
     }
 
+    pub(crate) fn insert_ref_index_id(&mut self, ref_index_id: Option<String>) {
+        if let Some(ref_index_id) = ref_index_id.filter(|value| !value.trim().is_empty()) {
+            self.ref_index_ids.insert(ref_index_id);
+        }
+    }
+
     pub(crate) fn contains(&self, message_id: &str) -> bool {
         self.message_ids.contains(message_id)
+    }
+
+    pub(crate) fn contains_ref_index_id(&self, ref_index_id: &str) -> bool {
+        self.ref_index_ids.contains(ref_index_id)
     }
 }
