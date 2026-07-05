@@ -90,7 +90,7 @@ pub(crate) fn should_ignore_group_message(
         );
         return true;
     }
-    if message.event_type != GroupEventType::GroupAtMessage
+    if !mentions_current_bot(message)
         && respond_content.trim().is_empty()
         && !is_reply_to_bot(message, bot_outbound_cache)
     {
@@ -106,12 +106,12 @@ pub(crate) fn should_ignore_group_message(
 
 /// 按群消息模式策略判断是否应处理该消息。
 ///
-/// `GroupAtMessage` 是 QQ 官方“机器人被 @”事件，直接视为 @ 机器人。
-/// 其余普通群消息按模式：
+/// QQ 官方 at 事件和普通群消息中的结构化 `is_you` 都归一为“提到当前机器人”。
+/// 后续只按群消息模式决定是否进入 Core：
 /// - Off：不处理；
 /// - Command：仅斜杠命令；
-/// - Mention：命令、官方 `is_you` @机器人、回复机器人；
-/// - Active：仅处理命中配置提示词的普通群消息。
+/// - Mention：命令、提到机器人、回复机器人；
+/// - Active：提到机器人或命中配置提示词。
 pub(crate) fn should_process_group_message(
     mode: GroupMessageMode,
     active_keywords: &[String],
@@ -120,11 +120,7 @@ pub(crate) fn should_process_group_message(
     _bot_identity: &SharedBotIdentity,
     bot_outbound_cache: &Arc<Mutex<BotOutboundCache>>,
 ) -> bool {
-    if message.event_type == GroupEventType::GroupAtMessage {
-        return true;
-    }
-
-    let mentions_current_bot = message.mentions.iter().any(|mention| mention.is_you);
+    let mentions_current_bot = mentions_current_bot(message);
 
     // QQ 有时把 `@机器人 /help` 作为普通群消息下发；
     // 此时原始 content 不是斜杠开头，需要使用 gateway 已归一化的 Core 文本判断命令。
@@ -148,6 +144,11 @@ pub(crate) fn should_process_group_message(
                 || contains_active_keyword(&message.content, active_keywords)
         }
     }
+}
+
+pub(crate) fn mentions_current_bot(message: &GroupMessage) -> bool {
+    message.event_type == GroupEventType::GroupAtMessage
+        || message.mentions.iter().any(|mention| mention.is_you)
 }
 
 /// 判断内容是否以 `/` 或全角 `／` 开头（群命令）。
@@ -246,7 +247,7 @@ mod tests {
             &bot_identity(),
             &cache
         ));
-        assert!(should_process_group_message(
+        assert!(!should_process_group_message(
             GroupMessageMode::Off,
             &active_keywords,
             &at_event,
@@ -299,6 +300,14 @@ mod tests {
             &active_keywords,
             &active_keyword,
             &active_keyword.content,
+            &bot_identity(),
+            &cache
+        ));
+        assert!(should_process_group_message(
+            GroupMessageMode::Active,
+            &active_keywords,
+            &at_event,
+            &at_event.content,
             &bot_identity(),
             &cache
         ));
@@ -494,6 +503,8 @@ mod tests {
             message_id: "bot-msg-1".to_owned(),
             ref_msg_idx: None,
             content: None,
+            input_parts: Vec::new(),
+            media_summaries: Vec::new(),
         });
 
         assert!(!should_ignore_group_message(
@@ -524,6 +535,8 @@ mod tests {
             message_id: "msg-current-or-unknown".to_owned(),
             ref_msg_idx: Some("REFIDX_bot_msg_1".to_owned()),
             content: None,
+            input_parts: Vec::new(),
+            media_summaries: Vec::new(),
         });
 
         assert!(!should_ignore_group_message(
@@ -555,6 +568,8 @@ mod tests {
             message_id: "REFIDX_bot_msg_1".to_owned(),
             ref_msg_idx: None,
             content: None,
+            input_parts: Vec::new(),
+            media_summaries: Vec::new(),
         });
 
         assert!(should_ignore_group_message(
@@ -630,6 +645,8 @@ mod tests {
             message_id: "bot-msg-1".to_owned(),
             ref_msg_idx: None,
             content: None,
+            input_parts: Vec::new(),
+            media_summaries: Vec::new(),
         });
 
         assert!(should_process_group_message(
@@ -654,6 +671,8 @@ mod tests {
             message_id: "msg-current-or-unknown".to_owned(),
             ref_msg_idx: Some("REFIDX_bot_msg_1".to_owned()),
             content: None,
+            input_parts: Vec::new(),
+            media_summaries: Vec::new(),
         });
 
         assert!(should_process_group_message(
@@ -679,6 +698,8 @@ mod tests {
             message_id: "REFIDX_bot_msg_1".to_owned(),
             ref_msg_idx: None,
             content: None,
+            input_parts: Vec::new(),
+            media_summaries: Vec::new(),
         });
 
         assert!(!should_process_group_message(

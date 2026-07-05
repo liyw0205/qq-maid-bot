@@ -17,7 +17,10 @@ use super::{
     cache::BotOutboundCache,
     dedupe::MessageDedupe,
     event::{GroupEventType, GroupMessage},
-    group_filter::{GroupCooldowns, should_ignore_group_message, should_process_group_message},
+    group_filter::{
+        GroupCooldowns, mentions_current_bot, should_ignore_group_message,
+        should_process_group_message,
+    },
     logging::{group_message_log_summary, mask_openid},
     media_fetch::{MediaFetchContext, fetch_qq_official_image_attachments},
     outbound::{
@@ -41,12 +44,12 @@ fn group_reply_mention_prefix(
     message: &GroupMessage,
     capability: &ReplyCapability,
 ) -> Option<String> {
-    // 只有用户显式 @ 机器人触发的官方群 at 事件，才在回复正文里 @ 回发起人；
+    // 只有官方确认提到当前机器人时，才在回复正文里 @ 回发起人；
     // 普通群命令、关键词触发和回复机器人消息继续只挂原消息 msg_id，避免额外打扰。
     if !capability.supports_at_mention {
         return None;
     }
-    if message.event_type != GroupEventType::GroupAtMessage {
+    if !mentions_current_bot(message) {
         return None;
     }
     message
@@ -57,26 +60,16 @@ fn group_reply_mention_prefix(
         .map(|member_openid| format!("<@{member_openid}>"))
 }
 
-fn prefix_group_reply_text(
-    message: &GroupMessage,
-    text: &str,
-    capability: &ReplyCapability,
-) -> String {
-    let Some(prefix) = group_reply_mention_prefix(message, capability) else {
-        return text.to_owned();
-    };
-    if text.trim().is_empty() {
-        prefix
-    } else {
-        format!("{prefix}\n{text}")
-    }
-}
-
 fn prefix_group_reply_outbound(
     message: &GroupMessage,
     outbound: OutboundMessage,
     capability: &ReplyCapability,
 ) -> OutboundMessage {
+    // QQ 官方群文本消息不会把 `<@openid>` 渲染成昵称，会直接暴露 openid。
+    // 只有 markdown 出站消息保留显式 at；纯文本命令依靠 reply target 关联原消息。
+    if !matches!(outbound, OutboundMessage::Markdown { .. }) {
+        return outbound;
+    }
     let Some(prefix) = group_reply_mention_prefix(message, capability) else {
         return outbound;
     };
@@ -84,13 +77,13 @@ fn prefix_group_reply_outbound(
 }
 
 fn group_respond_error_texts(
-    message: &GroupMessage,
+    _message: &GroupMessage,
     err: &crate::respond::RespondError,
-    capability: &ReplyCapability,
+    _capability: &ReplyCapability,
 ) -> (String, String) {
     let log_text = respond_error_to_qq_text(err);
-    // 群 at fallback 的实际 QQ 文本需要保留 <@openid>，但日志字段只能使用未加前缀的安全文案。
-    let qq_text = prefix_group_reply_text(message, &log_text, capability);
+    // 本地错误 fallback 是纯文本发送，不能拼 `<@openid>`，否则 QQ 会原样展示 openid。
+    let qq_text = log_text.clone();
     (qq_text, log_text)
 }
 
@@ -113,6 +106,7 @@ pub(super) async fn handle_group_message(
     let masked_group = mask_openid(&message.group_openid);
     let respond_content =
         crate::respond::build_group_respond_content(&message, &config.group_active_keywords);
+    observe_group_message_ref_index(&message, respond, ref_index);
     if should_ignore_group_message(
         &message,
         &respond_content,
@@ -258,6 +252,25 @@ pub(super) async fn handle_group_message(
         }
     }
     Ok(())
+}
+
+fn observe_group_message_ref_index(
+    message: &GroupMessage,
+    respond: &RespondClient,
+    ref_index: &SharedRefIndex,
+) {
+    if message.author_is_self || message.author_is_bot || message.current_msg_idx.is_none() {
+        return;
+    }
+    let inbound = respond.prepare_inbound(platform::qq_official::inbound_from_group(message));
+    match ref_index.lock() {
+        Ok(mut index) => index.insert_inbound(&inbound),
+        Err(_) => warn!(
+            message_id = %message.message_id,
+            group = %mask_openid(&message.group_openid),
+            "group inbound ref_index observe skipped because index lock is poisoned"
+        ),
+    }
 }
 
 async fn send_group_respond_response(
@@ -526,11 +539,13 @@ mod tests {
 
     struct MockCore {
         response: RespondResponse,
+        respond_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
     impl CoreService for MockCore {
         async fn respond(&self, _request: CoreRequest) -> Result<CoreRespondOutput, CoreError> {
+            self.respond_calls.fetch_add(1, Ordering::SeqCst);
             Ok(CoreRespondOutput::Complete(self.response.clone()))
         }
 
@@ -557,6 +572,10 @@ mod tests {
     }
 
     fn respond_client() -> RespondClient {
+        respond_client_with_counter(Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn respond_client_with_counter(respond_calls: Arc<AtomicUsize>) -> RespondClient {
         RespondClient::new(Arc::new(MockCore {
             response: RespondResponse {
                 text: None,
@@ -566,6 +585,7 @@ mod tests {
                 command: None,
                 diagnostics: None,
             },
+            respond_calls,
         }))
     }
 
@@ -683,17 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn group_at_reply_text_mentions_sender_when_member_openid_exists() {
-        let message = group_message("hello", GroupEventType::GroupAtMessage);
-        let capability = qq_group_capability();
-
-        assert_eq!(
-            prefix_group_reply_text(&message, "回复正文", &capability),
-            "<@member-1>\n回复正文"
-        );
-    }
-
-    #[test]
     fn group_at_respond_error_log_text_keeps_member_openid_out() {
         let message = group_message("hello", GroupEventType::GroupAtMessage);
         let error = crate::respond::RespondError::Core(qq_maid_core::service::CoreError::new(
@@ -705,36 +714,14 @@ mod tests {
 
         let (qq_text, log_text) = group_respond_error_texts(&message, &error, &capability);
 
-        assert!(qq_text.starts_with("<@member-1>\n"));
+        assert!(!qq_text.contains("member-1"));
+        assert!(!qq_text.contains("<@"));
         assert!(!log_text.contains("member-1"));
         assert!(!log_text.contains("<@"));
     }
 
     #[test]
-    fn group_reply_text_skips_mention_for_plain_group_message() {
-        let message = group_message("hello", GroupEventType::GroupMessage);
-        let capability = qq_group_capability();
-
-        assert_eq!(
-            prefix_group_reply_text(&message, "回复正文", &capability),
-            "回复正文"
-        );
-    }
-
-    #[test]
-    fn group_at_reply_text_skips_mention_without_member_openid() {
-        let mut message = group_message("hello", GroupEventType::GroupAtMessage);
-        message.member_openid = None;
-        let capability = qq_group_capability();
-
-        assert_eq!(
-            prefix_group_reply_text(&message, "回复正文", &capability),
-            "回复正文"
-        );
-    }
-
-    #[test]
-    fn group_at_reply_outbound_mentions_sender() {
+    fn group_at_reply_text_outbound_keeps_plain_text_without_openid_mention() {
         let message = group_message("hello", GroupEventType::GroupAtMessage);
         let capability = qq_group_capability();
         let outbound = OutboundMessage::Text {
@@ -744,7 +731,47 @@ mod tests {
         assert_eq!(
             prefix_group_reply_outbound(&message, outbound, &capability),
             OutboundMessage::Text {
-                text: "<@member-1>\n回复正文".to_owned(),
+                text: "回复正文".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn group_at_reply_markdown_outbound_mentions_sender() {
+        let message = group_message("hello", GroupEventType::GroupAtMessage);
+        let capability = qq_group_capability();
+        let outbound = OutboundMessage::Markdown {
+            markdown: crate::markdown::MarkdownPayload::new("**回复正文**"),
+            fallback_text: "回复正文".to_owned(),
+        };
+
+        assert_eq!(
+            prefix_group_reply_outbound(&message, outbound, &capability),
+            OutboundMessage::Markdown {
+                markdown: crate::markdown::MarkdownPayload::new("<@member-1>\n**回复正文**"),
+                fallback_text: "<@member-1>\n回复正文".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn structured_group_mention_markdown_reply_mentions_sender_like_at_event() {
+        let mut message = group_message("hello", GroupEventType::GroupMessage);
+        message.mentions = vec![crate::gateway::event::GroupMention {
+            is_you: true,
+            member_role: None,
+        }];
+        let capability = qq_group_capability();
+        let outbound = OutboundMessage::Markdown {
+            markdown: crate::markdown::MarkdownPayload::new("**回复正文**"),
+            fallback_text: "回复正文".to_owned(),
+        };
+
+        assert_eq!(
+            prefix_group_reply_outbound(&message, outbound, &capability),
+            OutboundMessage::Markdown {
+                markdown: crate::markdown::MarkdownPayload::new("<@member-1>\n**回复正文**"),
+                fallback_text: "<@member-1>\n回复正文".to_owned(),
             }
         );
     }
@@ -754,10 +781,17 @@ mod tests {
         let message = group_message("hello", GroupEventType::GroupAtMessage);
         let mut capability = qq_group_capability();
         capability.supports_at_mention = false;
+        let outbound = OutboundMessage::Markdown {
+            markdown: crate::markdown::MarkdownPayload::new("**回复正文**"),
+            fallback_text: "回复正文".to_owned(),
+        };
 
         assert_eq!(
-            prefix_group_reply_text(&message, "回复正文", &capability),
-            "回复正文"
+            prefix_group_reply_outbound(&message, outbound, &capability),
+            OutboundMessage::Markdown {
+                markdown: crate::markdown::MarkdownPayload::new("**回复正文**"),
+                fallback_text: "回复正文".to_owned(),
+            }
         );
     }
 
@@ -787,6 +821,51 @@ mod tests {
 
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         assert_eq!(media_file_count(&config.media_dir), 0);
+    }
+
+    #[tokio::test]
+    async fn plain_group_message_observes_ref_index_before_mode_policy_without_core_call() {
+        let config = test_config();
+        let mut message = group_message("普通群友消息", GroupEventType::GroupMessage);
+        message.message_id = "group-observed".to_owned();
+        message.current_msg_idx = Some("REFIDX_user_observed".to_owned());
+        let respond_calls = Arc::new(AtomicUsize::new(0));
+        let ref_index = crate::gateway::ref_index::ref_index();
+
+        handle_group_message(
+            message,
+            &config,
+            &respond_client_with_counter(respond_calls.clone()),
+            &api_client(),
+            &crate::gateway::dedupe::MessageDedupe::new(Duration::from_secs(60)),
+            &Arc::new(Mutex::new(BotOutboundCache::default())),
+            &Arc::new(Mutex::new(GroupCooldowns::default())),
+            &bot_identity(),
+            &GatewayRuntimeStatus::new(),
+            &ref_index,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(respond_calls.load(Ordering::SeqCst), 0);
+
+        let mut quoted = group_message("查看这条", GroupEventType::GroupAtMessage);
+        quoted.message_id = "group-quote".to_owned();
+        quoted.reply = Some(crate::gateway::event::MessageReply {
+            message_id: "qq_reply_payload_id".to_owned(),
+            ref_msg_idx: Some("REFIDX_user_observed".to_owned()),
+            content: None,
+            input_parts: Vec::new(),
+            media_summaries: Vec::new(),
+        });
+        let mut inbound =
+            respond_client().prepare_inbound(platform::qq_official::inbound_from_group(&quoted));
+        ref_index.lock().unwrap().enrich_inbound(&mut inbound);
+
+        let quoted_context = inbound.quoted.as_ref().unwrap();
+        assert!(quoted_context.lookup_found);
+        assert_eq!(quoted_context.text_summary.as_deref(), Some("普通群友消息"));
+        assert_eq!(quoted_context.from_bot, Some(false));
     }
 
     #[tokio::test]
@@ -938,6 +1017,8 @@ mod tests {
             message_id: "qq_reply_payload_id".to_owned(),
             ref_msg_idx: Some("REFIDX_1".to_owned()),
             content: None,
+            input_parts: Vec::new(),
+            media_summaries: Vec::new(),
         });
         assert!(should_process_group_message(
             crate::config::GroupMessageMode::Mention,
