@@ -2,6 +2,14 @@
 
 本文档基于 [keep a changelog](https://keepachangelog.com/zh-CN/1.0.0/) 格式，记录每个已发布版本的变更。
 
+## [v0.13.2] - 2026-07-06
+
+### Fixed
+
+* **QQ 群聊引用索引热修复**（PR #290）：收口真实平台 `message_id` 与 QQ 引用索引 `REFIDX_* / ref_msg_idx` 的字段边界，避免 `REFIDX_*` 污染 outbound cache、主动推送缓存或 Core 公共推送结果；群聊 quoted context 只使用引用索引恢复上下文，`reply.message_id` 不再被伪造成 `ref_msg_idx`。
+
+* **群聊回复机器人判定修正**（PR #290）：支持通过命中的 bot outbound `ref_msg_idx` 识别“回复机器人”，但不会仅凭 `ref_msg_idx` 存在或仅凭长得像 `REFIDX_*` 的 `reply.message_id` 误判；只有真实 `message_id` 的主动推送仍可成功投递，但不会写入伪造 ref_index。
+
 ## [v0.13.1] - 2026-07-06
 
 ### Added
