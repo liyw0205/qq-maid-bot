@@ -21,13 +21,16 @@ use crate::{
             common::{CommandBody, todo_error, truncate_chars},
         },
         session::SessionRecord,
-        todo::{TodoItem, TodoOwner, TodoStatus, TodoStore},
+        todo::{
+            ReminderFieldMode, TodoCardOptions, TodoItem, TodoListDateField, TodoListDateFilter,
+            TodoOwner, TodoRecurrenceKind, TodoRecurrenceUnit, TodoRenderItem, TodoStatus,
+            TodoStore, format_todo_cards, preview_next_reminder_at,
+        },
     },
 };
 
 use super::format::{
-    append_todo_collapse_hint, format_todo_full_detail_line, format_todo_natural_list_item,
-    format_todo_receipt_item_line, todo_due_chip, todo_timestamp_chip,
+    append_todo_collapse_hint, format_todo_natural_list_item, todo_due_chip, todo_timestamp_chip,
     visible_todo_all_board_items, visible_todo_items,
 };
 
@@ -57,6 +60,8 @@ struct RelatedListSpec {
     query_type: &'static str,
     condition: String,
     due_date: Option<NaiveDate>,
+    due_range: Option<(NaiveDate, NaiveDate)>,
+    date_field: TodoListDateField,
     title: &'static str,
     empty_text: &'static str,
     time_value: fn(&TodoItem) -> Option<String>,
@@ -310,31 +315,9 @@ fn list_todos_outcome(
 }
 
 fn todo_detail_body(output: &Value) -> CommandBody {
-    let item = output.get("item").unwrap_or(&Value::Null);
-    let title = string_value(item, "title").unwrap_or_else(|| "待办详情".to_owned());
-    let status = string_value(item, "status").unwrap_or_else(|| "unknown".to_owned());
-    let status_label = match status.as_str() {
-        "pending" => "未完成",
-        "completed" => "已完成",
-        "cancelled" => "已取消",
-        _ => "状态未知",
-    };
-    let display_time = string_value(item, "display_time").filter(|value| !value.trim().is_empty());
-    let detail = string_value(item, "detail");
-
-    let mut lines = vec![title];
-    let mut markdown_lines = vec![format!("# {}", lines[0])];
-    lines.push(format!("状态：{status_label}"));
-    markdown_lines.push(format!("**状态**：{status_label}"));
-    if let Some(time) = display_time {
-        lines.push(format!("时间：{time}"));
-        markdown_lines.push(format!("**时间**：{time}"));
-    }
-    if let Some(detail) = detail {
-        lines.push(format_todo_full_detail_line(&detail, false));
-        markdown_lines.push(format_todo_full_detail_line(&detail, true));
-    }
-    CommandBody::dual(lines.join("\n"), markdown_lines.join("\n"))
+    todo_detail_card_item_from_value(output.get("item"))
+        .map(|item| todo_detail_card_body("待办详情", &item))
+        .unwrap_or_else(|| CommandBody::plain("没有找到待办详情。"))
 }
 
 pub(in crate::runtime::respond) fn receipt_after_created(
@@ -343,27 +326,14 @@ pub(in crate::runtime::respond) fn receipt_after_created(
     owner: &TodoOwner,
     item: &TodoItem,
 ) -> Result<TodoWriteReceipt, LlmError> {
-    let lines = vec![
-        "✅ 已新增待办".to_owned(),
-        String::new(),
-        affected_item_line(item),
-    ];
-    let markdown_lines = vec![
-        "# ✅ 已新增待办".to_owned(),
-        String::new(),
-        affected_item_line_markdown(item),
-    ];
-    receipt_with_related_list(
+    receipt_with_related_list_body(
         todo_store,
         session,
         owner,
-        RelatedReceiptDraft {
-            lines,
-            markdown_lines,
-            spec: pending_list_spec(),
-            command: "todo_confirm",
-            trailing_hint: None,
-        },
+        todo_detail_card_body("✅ 已新增待办", &todo_detail_card_item_from_todo(item)),
+        pending_list_spec(),
+        "todo_confirm",
+        None,
     )
 }
 
@@ -481,15 +451,40 @@ fn receipt_from_tool_result_with_status(
                 .output
                 .get("completed")
                 .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            if let Some(items) = todo_detail_card_items_from_array(&result.output, "completed") {
-                let body = todo_detail_cards_body(&format!("✅ 已完成待办 · {count}条"), &items);
+                .map_or(0, Vec::len)
+                + result
+                    .output
+                    .get("advanced")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+            let mut items =
+                todo_detail_card_items_from_array(&result.output, "completed").unwrap_or_default();
+            items.extend(
+                todo_detail_card_items_from_array(&result.output, "advanced").unwrap_or_default(),
+            );
+            if !items.is_empty() {
+                let has_advanced = result
+                    .output
+                    .get("advanced")
+                    .and_then(Value::as_array)
+                    .is_some_and(|values| !values.is_empty());
+                let title = if has_advanced {
+                    format!("✅ 已完成本次待办 · {count}条")
+                } else {
+                    format!("✅ 已完成待办 · {count}条")
+                };
+                let body = todo_detail_cards_body(&title, &items);
                 return mutation_receipt(body, "todo_complete");
             }
-            let lines =
-                success_count_lines("✅ 已完成待办", count, "条", "completed", &result.output);
+            let lines = success_count_lines(
+                "✅ 已完成本次待办",
+                count,
+                "条",
+                "completed",
+                &result.output,
+            );
             let markdown_lines = success_count_markdown_lines(
-                "✅ 已完成待办",
+                "✅ 已完成本次待办",
                 count,
                 "条",
                 "completed",
@@ -608,6 +603,31 @@ fn receipt_with_related_list(
         command,
         error_code: None,
     })
+}
+
+fn receipt_with_related_list_body(
+    todo_store: &TodoStore,
+    session: &mut SessionRecord,
+    owner: &TodoOwner,
+    body: CommandBody,
+    spec: RelatedListSpec,
+    command: &'static str,
+    trailing_hint: Option<&'static str>,
+) -> Result<TodoWriteReceipt, LlmError> {
+    let text = body.text;
+    let markdown = body.markdown.unwrap_or_else(|| text.clone());
+    receipt_with_related_list(
+        todo_store,
+        session,
+        owner,
+        RelatedReceiptDraft {
+            lines: vec![text],
+            markdown_lines: vec![markdown],
+            spec,
+            command,
+            trailing_hint,
+        },
+    )
 }
 
 fn related_list_body(
@@ -805,11 +825,30 @@ fn list_for_related_spec(
     spec: &RelatedListSpec,
 ) -> Result<Vec<TodoItem>, crate::runtime::todo::TodoError> {
     if spec.query_type == "all" {
-        if let Some(due_date) = spec.due_date {
+        if let Some((start, end)) = spec.due_range {
+            todo_store.list_all_by_date_filter_for_board(
+                owner,
+                TodoListDateFilter {
+                    start,
+                    end,
+                    field: spec.date_field,
+                },
+            )
+        } else if let Some(due_date) = spec.due_date {
             todo_store.list_all_by_due_date_for_board(owner, due_date)
         } else {
             todo_store.list_all_for_board(owner)
         }
+    } else if let Some((start, end)) = spec.due_range {
+        todo_store.list_by_date_filter(
+            owner,
+            spec.status.clone(),
+            TodoListDateFilter {
+                start,
+                end,
+                field: spec.date_field,
+            },
+        )
     } else if let Some(due_date) = spec.due_date {
         todo_store.list_by_due_date(owner, spec.status.clone(), due_date)
     } else {
@@ -835,6 +874,8 @@ fn pending_list_spec() -> RelatedListSpec {
         query_type: "list",
         condition: String::new(),
         due_date: None,
+        due_range: None,
+        date_field: TodoListDateField::Planned,
         title: "🚧 当前进行中",
         empty_text: "当前没有进行中的待办。",
         time_value: todo_due_chip,
@@ -847,6 +888,8 @@ fn completed_list_spec() -> RelatedListSpec {
         query_type: "completed-list",
         condition: "已完成列表".to_owned(),
         due_date: None,
+        due_range: None,
+        date_field: TodoListDateField::Planned,
         title: "✅ 当前已完成",
         empty_text: "当前没有已完成待办。",
         time_value: display_todo_completed_at,
@@ -859,6 +902,8 @@ fn cancelled_list_spec() -> RelatedListSpec {
         query_type: "cancelled-list",
         condition: "已取消列表".to_owned(),
         due_date: None,
+        due_range: None,
+        date_field: TodoListDateField::Planned,
         title: "⛔ 当前已取消",
         empty_text: "当前没有已取消待办。",
         time_value: display_todo_cancelled_at,
@@ -881,6 +926,20 @@ fn list_spec_from_output(output: &Value) -> RelatedListSpec {
         if matches!(status.as_deref(), None | Some("pending")) {
             spec.query_type = "due-date";
         }
+    } else if let (Some(start), Some(end)) = (
+        string_field(output, "due_start")
+            .and_then(|value| NaiveDate::parse_from_str(&value, "%Y-%m-%d").ok()),
+        string_field(output, "due_end")
+            .and_then(|value| NaiveDate::parse_from_str(&value, "%Y-%m-%d").ok()),
+    ) {
+        spec.condition = string_field(output, "date_range_text").unwrap_or_else(|| {
+            format!("{} 至 {}", start.format("%Y-%m-%d"), end.format("%Y-%m-%d"))
+        });
+        spec.due_range = Some((start, end));
+        spec.date_field = date_field_from_output(output, status.as_deref());
+        if matches!(status.as_deref(), None | Some("pending")) {
+            spec.query_type = "due-date";
+        }
     }
     spec
 }
@@ -891,9 +950,24 @@ fn all_list_spec() -> RelatedListSpec {
         query_type: "all",
         condition: "全部待办".to_owned(),
         due_date: None,
+        due_range: None,
+        date_field: TodoListDateField::Planned,
         title: "📋 全部待办",
         empty_text: "当前没有待办。",
         time_value: todo_due_chip,
+    }
+}
+
+fn date_field_from_output(output: &Value, status: Option<&str>) -> TodoListDateField {
+    match string_field(output, "date_range_field").as_deref() {
+        Some("completed_at") => TodoListDateField::CompletedAt,
+        Some("cancelled_at") => TodoListDateField::CancelledAt,
+        Some("planned") => TodoListDateField::Planned,
+        _ => match status {
+            Some("completed") => TodoListDateField::CompletedAt,
+            Some("cancelled") => TodoListDateField::CancelledAt,
+            _ => TodoListDateField::Planned,
+        },
     }
 }
 
@@ -985,14 +1059,6 @@ fn success_count_markdown_lines(
     lines
 }
 
-fn affected_item_line(item: &TodoItem) -> String {
-    format_todo_receipt_item_line(item, false).join("\n")
-}
-
-fn affected_item_line_markdown(item: &TodoItem) -> String {
-    format_todo_receipt_item_line(item, true).join("\n")
-}
-
 #[derive(Debug, Clone)]
 struct ReceiptItem {
     title: String,
@@ -1006,7 +1072,12 @@ struct TodoDetailCardItem {
     due_date: Option<String>,
     due_at: Option<String>,
     reminder_at: Option<String>,
+    recurrence_kind: TodoRecurrenceKind,
+    recurrence_interval_days: u32,
+    recurrence_interval: u32,
+    recurrence_unit: TodoRecurrenceUnit,
     status: Option<String>,
+    next_reminder_at: Option<String>,
     completed_at: Option<String>,
     cancelled_at: Option<String>,
 }
@@ -1039,7 +1110,15 @@ fn todo_detail_card_item_from_value(value: Option<&Value>) -> Option<TodoDetailC
         due_date: string_field(value, "due_date"),
         due_at: string_field(value, "due_at"),
         reminder_at: string_field(value, "reminder_at"),
+        recurrence_kind: recurrence_kind_field(value, "recurrence_kind")
+            .unwrap_or(TodoRecurrenceKind::None),
+        recurrence_interval_days: positive_u32_field(value, "recurrence_interval_days")
+            .unwrap_or_default(),
+        recurrence_interval: positive_u32_field(value, "recurrence_interval").unwrap_or_default(),
+        recurrence_unit: recurrence_unit_field(value, "recurrence_unit")
+            .unwrap_or(TodoRecurrenceUnit::Day),
         status: string_field(value, "status"),
+        next_reminder_at: string_field(value, "next_reminder_at"),
         completed_at: string_field(value, "completed_at"),
         cancelled_at: string_field(value, "cancelled_at"),
     })
@@ -1060,16 +1139,20 @@ fn todo_detail_card_body(title: &str, item: &TodoDetailCardItem) -> CommandBody 
 }
 
 fn todo_detail_cards_body(title: &str, items: &[TodoDetailCardItem]) -> CommandBody {
-    let mut lines = vec![title.to_owned()];
-    let mut markdown_lines = vec![format!("# {title}")];
-    for (index, item) in items.iter().enumerate() {
-        lines.push(String::new());
-        markdown_lines.push(String::new());
-        let numbered = items.len() > 1;
-        append_todo_detail_card_lines(&mut lines, item, false, index, numbered);
-        append_todo_detail_card_lines(&mut markdown_lines, item, true, index, numbered);
-    }
-    CommandBody::dual(lines.join("\n"), markdown_lines.join("\n"))
+    let render_items = items
+        .iter()
+        .cloned()
+        .map(todo_render_item_from_detail_card)
+        .collect::<Vec<_>>();
+    let body = format_todo_cards(
+        title,
+        &render_items,
+        TodoCardOptions {
+            reminder_mode: ReminderFieldMode::Current,
+            show_next_reminder: true,
+        },
+    );
+    CommandBody::dual(body.text, body.markdown)
 }
 
 fn append_todo_detail_card_lines(
@@ -1079,84 +1162,94 @@ fn append_todo_detail_card_lines(
     index: usize,
     numbered: bool,
 ) {
-    let title = if numbered {
-        format!("{}. {}", index + 1, item.title)
-    } else {
-        item.title.clone()
-    };
-    let mut title_line = title;
-    if let Some(time) = detail_card_due_chip(item) {
-        if markdown {
-            title_line.push_str(&format!(" · **时间**：{time}"));
-        } else {
-            title_line.push_str(&format!(" · 时间：{time}"));
-        }
+    let mut render_item = todo_render_item_from_detail_card(item.clone());
+    if numbered {
+        render_item.title = format!("{}. {}", index + 1, render_item.title);
     }
-    lines.push(title_line);
-    if let Some(status) = item.status.as_deref().and_then(todo_status_display_label) {
-        lines.push(if markdown {
-            format!("**状态**：{status}")
-        } else {
-            format!("状态：{status}")
-        });
-    }
-    if let Some(reminder_at) = item.reminder_at.as_deref()
-        && let Some(reminder) = todo_timestamp_chip(reminder_at)
-    {
-        lines.push(if markdown {
-            format!("**提醒**：{reminder}")
-        } else {
-            format!("提醒：{reminder}")
-        });
-    }
-    if let Some(detail) = item.detail.as_deref() {
-        lines.push(format_todo_full_detail_line(detail, markdown));
-    }
-    if item.status.as_deref() == Some("completed")
-        && let Some(completed_at) = item.completed_at.as_deref()
-        && let Some(completed) = todo_timestamp_chip(completed_at)
-    {
-        lines.push(if markdown {
-            format!("**完成时间**：{completed}")
-        } else {
-            format!("完成时间：{completed}")
-        });
-    }
-    if item.status.as_deref() == Some("cancelled")
-        && let Some(cancelled_at) = item.cancelled_at.as_deref()
-        && let Some(cancelled) = todo_timestamp_chip(cancelled_at)
-    {
-        lines.push(if markdown {
-            format!("**取消时间**：{cancelled}")
-        } else {
-            format!("取消时间：{cancelled}")
-        });
-    }
+    let body = format_todo_cards(
+        "__card__",
+        &[render_item],
+        TodoCardOptions {
+            reminder_mode: ReminderFieldMode::Current,
+            show_next_reminder: true,
+        },
+    );
+    let rendered = if markdown { body.markdown } else { body.text };
+    let mut parts = rendered.lines();
+    let _ = parts.next();
+    lines.extend(parts.map(str::to_owned));
 }
 
-fn detail_card_due_chip(item: &TodoDetailCardItem) -> Option<String> {
-    item.due_at
-        .as_deref()
-        .and_then(todo_timestamp_chip)
-        .or_else(|| item.due_date.as_deref().and_then(todo_timestamp_chip))
-}
-
-fn todo_status_display_label(status: &str) -> Option<&'static str> {
-    match status {
-        "pending" => Some("进行中"),
-        "completed" => Some("已完成"),
-        "cancelled" => Some("已取消"),
+fn recurrence_kind_field(value: &Value, key: &str) -> Option<TodoRecurrenceKind> {
+    match value.get(key).and_then(Value::as_str) {
+        Some("none") => Some(TodoRecurrenceKind::None),
+        Some("daily") => Some(TodoRecurrenceKind::Daily),
+        Some("every_n_days") => Some(TodoRecurrenceKind::EveryNDays),
+        Some("weekly") => Some(TodoRecurrenceKind::Weekly),
+        Some("every_n_weeks") => Some(TodoRecurrenceKind::EveryNWeeks),
+        Some("monthly") => Some(TodoRecurrenceKind::Monthly),
+        Some("every_n_months") => Some(TodoRecurrenceKind::EveryNMonths),
+        Some("yearly") => Some(TodoRecurrenceKind::Yearly),
+        Some("every_n_years") => Some(TodoRecurrenceKind::EveryNYears),
         _ => None,
     }
 }
 
-fn string_value(value: &Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+fn recurrence_unit_field(value: &Value, key: &str) -> Option<TodoRecurrenceUnit> {
+    match value.get(key).and_then(Value::as_str) {
+        Some("day") => Some(TodoRecurrenceUnit::Day),
+        Some("week") => Some(TodoRecurrenceUnit::Week),
+        Some("month") => Some(TodoRecurrenceUnit::Month),
+        Some("year") => Some(TodoRecurrenceUnit::Year),
+        _ => None,
+    }
+}
+
+fn positive_u32_field(value: &Value, key: &str) -> Option<u32> {
+    value.get(key).and_then(Value::as_u64)?.try_into().ok()
+}
+
+fn todo_render_item_from_detail_card(item: TodoDetailCardItem) -> TodoRenderItem {
+    TodoRenderItem {
+        title: item.title,
+        detail: item.detail,
+        due_date: item.due_date,
+        due_at: item.due_at,
+        reminder_at: item.reminder_at,
+        recurrence_kind: item.recurrence_kind,
+        recurrence_interval_days: item.recurrence_interval_days,
+        recurrence_interval: item.recurrence_interval,
+        recurrence_unit: item.recurrence_unit,
+        status: item.status,
+        next_reminder_at: item.next_reminder_at,
+        completed_at: item.completed_at,
+        cancelled_at: item.cancelled_at,
+    }
+}
+
+fn todo_detail_card_item_from_todo(item: &TodoItem) -> TodoDetailCardItem {
+    TodoDetailCardItem {
+        title: item.title.clone(),
+        detail: item.detail.clone(),
+        due_date: item.due_date.clone(),
+        due_at: item.due_at.clone(),
+        reminder_at: item.reminder_at.clone(),
+        recurrence_kind: item.recurrence_kind.clone(),
+        recurrence_interval_days: item.recurrence_interval_days,
+        recurrence_interval: item.recurrence_interval,
+        recurrence_unit: item.recurrence_unit,
+        status: Some(
+            match item.status {
+                TodoStatus::Pending => "pending",
+                TodoStatus::Completed => "completed",
+                TodoStatus::Cancelled => "cancelled",
+            }
+            .to_owned(),
+        ),
+        next_reminder_at: preview_next_reminder_at(item).ok().flatten(),
+        completed_at: item.completed_at.clone(),
+        cancelled_at: item.cancelled_at.clone(),
+    }
 }
 
 fn error_reply_for_tool_result(output: &Value) -> String {

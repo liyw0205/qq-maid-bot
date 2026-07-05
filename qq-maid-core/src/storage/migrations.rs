@@ -13,7 +13,10 @@ use crate::storage::{
         RSS_SUBSCRIPTIONS_SCHEMA,
     },
     session::{SESSION_CLEAN_REMOVED_CHAT_STATE_V3, SESSION_SCHEMA_V1, SESSION_SCHEMA_V2},
-    todo::{TODO_REMINDER_SCHEMA_V2, TODO_SCHEMA_V1},
+    todo::{
+        TODO_RECURRENCE_RULE_SCHEMA_V4, TODO_RECURRENCE_SCHEMA_V3, TODO_REMINDER_SCHEMA_V2,
+        TODO_SCHEMA_V1,
+    },
 };
 
 /// 应用通用 SQLite 数据库需要执行的 migration，顺序即项目级 schema 初始化顺序。
@@ -26,6 +29,8 @@ pub const APP_MIGRATIONS: &[SqliteMigration] = &[
     RSS_PENDING_REBASELINE_MIGRATION,
     TODO_SCHEMA_V1,
     TODO_REMINDER_SCHEMA_V2,
+    TODO_RECURRENCE_SCHEMA_V3,
+    TODO_RECURRENCE_RULE_SCHEMA_V4,
     NOTIFICATION_OUTBOX_SCHEMA_V1,
     NOTIFICATION_OUTBOX_TARGET_SCHEMA_V2,
     SESSION_SCHEMA_V1,
@@ -106,6 +111,10 @@ mod tests {
                     due_at: None,
                     reminder_at: None,
                     time_precision: TodoTimePrecision::None,
+                    recurrence_kind: crate::runtime::todo::TodoRecurrenceKind::None,
+                    recurrence_interval_days: 0,
+                    recurrence_interval: 0,
+                    recurrence_unit: crate::runtime::todo::TodoRecurrenceUnit::Day,
                 },
             )
             .unwrap();

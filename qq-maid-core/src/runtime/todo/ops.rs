@@ -17,8 +17,8 @@
 use crate::runtime::{
     session::SessionRecord,
     todo::{
-        TodoBulkCancelOutcome, TodoBulkCompleteOutcome, TodoBulkRestoreOutcome, TodoItem,
-        TodoItemDraft, TodoOwner, TodoStore,
+        TodoBulkCancelOutcome, TodoBulkCompleteOutcome, TodoBulkRestoreOutcome,
+        TodoCompleteProgressOutcome, TodoItem, TodoItemDraft, TodoOwner, TodoStore,
     },
 };
 
@@ -89,6 +89,25 @@ pub fn complete_many(
     if !outcome.completed.is_empty() {
         session.last_todo_query = None;
         session.update_last_todo_action_from_items(&owner.key, "completed", &outcome.completed);
+    }
+    Ok(outcome)
+}
+
+/// 批量“完成本次待办”，兼容一次性待办与重复待办。
+///
+/// 一次性待办沿用原 Completed 终态；重复待办则保留 Pending，
+/// 仅把时间推进到下一次，避免预生成无限未来实例。
+pub fn complete_many_with_recurrence(
+    store: &TodoStore,
+    session: &mut SessionRecord,
+    owner: &TodoOwner,
+    ids: &[String],
+) -> Result<TodoCompleteProgressOutcome, crate::runtime::todo::TodoError> {
+    let outcome = store.complete_by_ids_with_recurrence(owner, ids)?;
+    let changed = outcome.all_changed();
+    if !changed.is_empty() {
+        session.last_todo_query = None;
+        session.update_last_todo_action_from_items(&owner.key, "completed", &changed);
     }
     Ok(outcome)
 }

@@ -102,9 +102,31 @@ impl Tool for EditTodoTool {
                         "type": ["string", "null"],
                         "enum": ["none", "date", "date_time", "inferred", null],
                         "description": "新的时间精度；未明确修改时传 null"
+                    },
+                    "recurrence_kind": {
+                        "type": ["string", "null"],
+                        "enum": ["none", "daily", "every_n_days", "weekly", "every_n_weeks", "monthly", "every_n_months", "yearly", "every_n_years", null],
+                        "description": "新的重复规则；优先配合 recurrence_interval + recurrence_unit 表达 day/week/month/year；不修改传 null；清除重复规则时传 \"none\"。"
+                    },
+                    "recurrence_interval": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
+                        "maximum": 1827,
+                        "description": "新的重复间隔数值；day 最大 1827，week 最大 261，month 最大 60，year 最大 5；不修改传 null。"
+                    },
+                    "recurrence_unit": {
+                        "type": ["string", "null"],
+                        "enum": ["day", "week", "month", "year", null],
+                        "description": "新的重复间隔单位；不修改传 null。"
+                    },
+                    "recurrence_interval_days": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
+                        "maximum": 1827,
+                        "description": "旧兼容字段：仅用于 day 单位；新调用优先使用 recurrence_interval + recurrence_unit。"
                     }
                 },
-                "required": ["number", "reference", "raw_text", "title", "detail", "due_date", "due_at", "reminder_at", "time_precision"],
+                "required": ["number", "reference", "raw_text", "title", "detail", "due_date", "due_at", "reminder_at", "time_precision", "recurrence_kind", "recurrence_interval", "recurrence_unit", "recurrence_interval_days"],
                 "additionalProperties": false
             }),
         }

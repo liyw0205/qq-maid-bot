@@ -12,7 +12,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::todo::{TodoItemDraft, TodoTimePrecision};
+use crate::runtime::todo::{
+    TodoEditRecurrencePatch, TodoItemDraft, TodoRecurrenceKind, TodoRecurrenceUnit,
+    TodoTimePrecision, apply_recurrence_patch_to_draft,
+};
 
 /// 待办编辑操作的增量补丁，只包含需要修改的字段。
 ///
@@ -33,6 +36,14 @@ pub struct TodoEditPatch {
     pub reminder_at: Option<String>,
     /// 新的时间精度；未明确修改时为 None。
     pub time_precision: Option<TodoTimePrecision>,
+    /// 新的重复规则；未明确修改时为 None。
+    pub recurrence_kind: Option<TodoRecurrenceKind>,
+    /// 新的重复间隔天数；未明确修改时为 None。
+    pub recurrence_interval_days: Option<u32>,
+    /// 新的重复间隔数值；未明确修改时为 None。
+    pub recurrence_interval: Option<u32>,
+    /// 新的重复间隔单位；未明确修改时为 None。
+    pub recurrence_unit: Option<TodoRecurrenceUnit>,
 }
 
 impl TodoEditPatch {
@@ -44,6 +55,10 @@ impl TodoEditPatch {
             || self.due_at.is_some()
             || self.reminder_at.is_some()
             || self.time_precision.is_some()
+            || self.recurrence_kind.is_some()
+            || self.recurrence_interval_days.is_some()
+            || self.recurrence_interval.is_some()
+            || self.recurrence_unit.is_some()
     }
 }
 
@@ -72,28 +87,43 @@ pub fn apply_to_draft(
         draft.due_at = Some(due_at.clone());
         // 设置截止时间时同步覆盖截止日期，保持 due_at / due_date 一致。
         draft.due_date = patch.due_date.clone();
-        draft.time_precision = patch
-            .time_precision
-            .clone()
-            .unwrap_or(TodoTimePrecision::DateTime);
+        draft.time_precision = patch.time_precision.unwrap_or(TodoTimePrecision::DateTime);
     } else if let Some(due_date) = &patch.due_date {
         draft.due_date = Some(due_date.clone());
         // 仅设日期时清空时间分量，避免旧 due_at 残留导致精度语义错乱。
         draft.due_at = None;
-        draft.time_precision = patch
-            .time_precision
-            .clone()
-            .unwrap_or(TodoTimePrecision::Date);
+        draft.time_precision = patch.time_precision.unwrap_or(TodoTimePrecision::Date);
     } else if let Some(precision) = &patch.time_precision {
-        draft.time_precision = precision.clone();
+        draft.time_precision = *precision;
     }
     if let Some(reminder_at) = &patch.reminder_at {
-        draft.reminder_at = if reminder_at.trim().is_empty() {
+        let old_reminder_at = draft.reminder_at.clone();
+        let reminder_backfilled_due_at =
+            patch.due_at.is_none() && patch.due_date.is_none() && draft.due_at == old_reminder_at;
+        let next_reminder_at = if reminder_at.trim().is_empty() {
             None
         } else {
             Some(reminder_at.clone())
         };
+        if reminder_backfilled_due_at {
+            draft.due_at = next_reminder_at.clone();
+            if next_reminder_at.is_none() && draft.due_date.is_none() {
+                draft.time_precision = TodoTimePrecision::None;
+            } else if next_reminder_at.is_some() {
+                draft.time_precision = patch.time_precision.unwrap_or(TodoTimePrecision::DateTime);
+            }
+        }
+        draft.reminder_at = next_reminder_at;
     }
+    apply_recurrence_patch_to_draft(
+        &mut draft,
+        TodoEditRecurrencePatch {
+            kind: patch.recurrence_kind.clone(),
+            interval_days: patch.recurrence_interval_days,
+            interval: patch.recurrence_interval,
+            unit: patch.recurrence_unit,
+        },
+    );
     draft.raw_text = Some(raw_text.to_owned());
     draft
 }

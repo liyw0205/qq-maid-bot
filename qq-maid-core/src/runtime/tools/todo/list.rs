@@ -5,7 +5,10 @@ use serde_json::json;
 
 use qq_maid_llm::tool::{Tool, ToolContext, ToolMetadata, ToolOutput};
 
+use chrono::NaiveDate;
+
 use crate::error::LlmError;
+use crate::runtime::todo::{TodoStatus, resolve_todo_list_date_filter};
 
 use super::common::{
     LIST_TODOS_TOOL_NAME, bad_tool_arguments, optional_text, todo_status_argument, todo_tool_error,
@@ -35,7 +38,7 @@ impl Tool for ListTodoTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             name: LIST_TODOS_TOOL_NAME.to_owned(),
-            description: "查询当前私聊用户的待办列表。不会返回数据库内部 ID；visible_number 只供本轮 Tool Loop 内部推理和后续工具调用使用，不会覆盖用户跨轮次真正看到的列表编号。status=pending 查询未完成，completed 查询已完成，cancelled 查询已取消，all 查询全部。查询今天、明天或明确日期内的待办时传 due_date=YYYY-MM-DD；日期条件按本地自然日匹配计划时间/到期时间，无时间待办不会命中。".to_owned(),
+            description: "查询当前私聊用户的待办列表。不会返回数据库内部 ID；visible_number 只供本轮 Tool Loop 内部推理和后续工具调用使用，不会覆盖用户跨轮次真正看到的列表编号。status=pending 查询未完成，completed 查询已完成，cancelled 查询已取消，all 查询全部。查询今天、昨天、本周、上周、本月、最近 N 天等时间范围时，把用户原始中文范围传给 date_range_text；Rust 会按请求时间和时区归一化，模型不要自行换算绝对日期。".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -46,10 +49,14 @@ impl Tool for ListTodoTool {
                     },
                     "due_date": {
                         "type": ["string", "null"],
-                        "description": "按计划日期筛选，格式 YYYY-MM-DD；例如今天/明天查询时由模型先换算为具体本地日期。无日期筛选时必须传 null。"
+                        "description": "旧兼容字段：按单日计划日期筛选。新调用应优先把用户原始时间表达传给 date_range_text，不要让模型自行换算绝对日期。无日期筛选时传 null。"
+                    },
+                    "date_range_text": {
+                        "type": ["string", "null"],
+                        "description": "用户原始中文时间范围，例如“今天”“昨天”“前天”“本周”“上周”“下周”“本月”“上月”“最近 7 天”“这几天”“这两天”“明后天”。无范围筛选时传 null。"
                     }
                 },
-                "required": ["status", "due_date"],
+                "required": ["status", "due_date", "date_range_text"],
                 "additionalProperties": false
             }),
         }
@@ -64,6 +71,20 @@ impl Tool for ListTodoTool {
 
         let mut scope = TodoToolScope::load(&self.session_store, &context, None)?;
         let status = todo_status_argument(&arguments, "status")?;
+        let date_range = optional_text(&arguments, "date_range_text")?
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                let ctx = crate::util::time_context::request_time_context();
+                crate::util::time_context::parse_date_range_expression(&value, &ctx)
+                    .map(|range| (range.start, range.end, range.raw))
+                    .ok_or_else(|| {
+                        bad_tool_arguments(
+                            "date_range_text must be one of 今天/昨天/前天/本周/上周/下周/本月/上月/最近N天/这几天/这两天/明后天",
+                        )
+                    })
+            })
+            .transpose()?;
         let due_date = optional_text(&arguments, "due_date")?
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
@@ -74,25 +95,28 @@ impl Tool for ListTodoTool {
                     .ok_or_else(|| bad_tool_arguments("due_date must be a valid YYYY-MM-DD date"))
             })
             .transpose()?;
-        let items = match (status, due_date) {
-            (TodoToolListStatus::Pending, Some(date)) => self.todo_store.list_by_due_date(
-                &scope.owner,
-                crate::runtime::todo::TodoStatus::Pending,
-                date,
-            ),
-            (TodoToolListStatus::Completed, Some(date)) => self.todo_store.list_by_due_date(
-                &scope.owner,
-                crate::runtime::todo::TodoStatus::Completed,
-                date,
-            ),
-            (TodoToolListStatus::Cancelled, Some(date)) => self.todo_store.list_by_due_date(
-                &scope.owner,
-                crate::runtime::todo::TodoStatus::Cancelled,
-                date,
-            ),
-            (TodoToolListStatus::All, Some(date)) => self
+        let date_filter = resolve_todo_list_date_filter(
+            status.storage_status(),
+            due_date,
+            date_range.as_ref().map(|(start, end, _)| (*start, *end)),
+        )
+        .map_err(todo_tool_error)?;
+        let items = match (status, date_filter) {
+            (TodoToolListStatus::Pending, Some(filter)) => {
+                self.todo_store
+                    .list_by_date_filter(&scope.owner, TodoStatus::Pending, filter)
+            }
+            (TodoToolListStatus::Completed, Some(filter)) => {
+                self.todo_store
+                    .list_by_date_filter(&scope.owner, TodoStatus::Completed, filter)
+            }
+            (TodoToolListStatus::Cancelled, Some(filter)) => {
+                self.todo_store
+                    .list_by_date_filter(&scope.owner, TodoStatus::Cancelled, filter)
+            }
+            (TodoToolListStatus::All, Some(filter)) => self
                 .todo_store
-                .list_all_by_due_date_for_board(&scope.owner, date),
+                .list_all_by_date_filter_for_board(&scope.owner, filter),
             (TodoToolListStatus::Pending, None) => self.todo_store.list_pending(&scope.owner),
             (TodoToolListStatus::Completed, None) => self.todo_store.list_completed(&scope.owner),
             (TodoToolListStatus::Cancelled, None) => self.todo_store.list_cancelled(&scope.owner),
@@ -101,24 +125,51 @@ impl Tool for ListTodoTool {
             (TodoToolListStatus::All, None) => self.todo_store.list_all_for_board(&scope.owner),
         }
         .map_err(todo_tool_error)?;
-        let due_date_text = due_date.map(|date| date.format("%Y-%m-%d").to_string());
-        let query_type = if due_date_text.is_some() && matches!(status, TodoToolListStatus::Pending)
-        {
+        let due_date_text = date_filter.and_then(|filter| {
+            (filter.start == filter.end).then(|| filter.start.format("%Y-%m-%d").to_string())
+        });
+        let due_start = date_filter.map(|filter| format_date(filter.start));
+        let due_end = date_filter.map(|filter| format_date(filter.end));
+        let date_range_field = date_filter.map(|filter| filter.field.as_str());
+        let date_range_label = date_range.as_ref().map(|(_, _, raw)| raw.clone());
+        let query_type = if date_filter.is_some() && matches!(status, TodoToolListStatus::Pending) {
             "due-date"
         } else {
             status.query_type()
         };
-        let condition = due_date_text
+        let condition = date_range_label
             .as_deref()
+            .or(due_date_text.as_deref())
             .unwrap_or_else(|| status.condition());
         scope.remember_internal_query(query_type, condition, &items)?;
 
         Ok(ToolOutput::json(json!({
             "status": status.as_str(),
             "due_date": due_date_text,
+            "due_start": due_start,
+            "due_end": due_end,
+            "date_range_start": due_start,
+            "date_range_end": due_end,
+            "date_range_text": date_range_label,
+            "date_range_field": date_range_field,
             "items": todo_items_json(&items),
             "count": items.len(),
             "numbering": "visible_number 是本轮工具查询编号，仅在当前 Tool Loop 内有效；用户跨轮次的第 N 条仍以最近实际展示给用户的 /todo 列表为准；未暴露数据库内部 ID。"
         })))
+    }
+}
+
+fn format_date(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
+
+impl super::common::TodoToolListStatus {
+    fn storage_status(self) -> Option<TodoStatus> {
+        match self {
+            Self::Pending => Some(TodoStatus::Pending),
+            Self::Completed => Some(TodoStatus::Completed),
+            Self::Cancelled => Some(TodoStatus::Cancelled),
+            Self::All => None,
+        }
     }
 }
