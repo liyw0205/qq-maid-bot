@@ -1,10 +1,11 @@
 use super::support::*;
 use crate::runtime::{
-    pending::PendingOperation,
-    session::now_iso_cn,
+    pending::{ClarificationCandidate, PendingOperation, PendingTodoClarification},
+    session::{SessionMeta, now_iso_cn},
     todo::{TodoItemDraft, TodoStatus, TodoStore, TodoTimePrecision},
 };
 use crate::service::CoreInboundKind;
+use serde_json::json;
 
 fn draft(title: &str) -> TodoItemDraft {
     TodoItemDraft {
@@ -29,6 +30,36 @@ fn save_pending(service: &crate::runtime::respond::RustRespondService, pending: 
         .unwrap();
     session.pending_operation = Some(pending);
     service.session_store.save(&mut session).unwrap();
+}
+
+fn stable_group_scope() -> &'static str {
+    "platform:qq_official:account:app-1:group:g1"
+}
+
+fn stable_group_interaction_meta(user_id: &str) -> SessionMeta {
+    SessionMeta::new_with_account(
+        format!("{}:actor:{user_id}", stable_group_scope()),
+        Some(user_id.to_owned()),
+        Some("g1".to_owned()),
+        None,
+        None,
+        "qq_official",
+        Some("app-1".to_owned()),
+    )
+}
+
+fn stable_group_message(text: &str, user_id: &str) -> crate::runtime::respond::RespondRequest {
+    crate::runtime::respond::RespondRequest {
+        content: text.to_owned(),
+        scope_key: stable_group_scope().to_owned(),
+        user_id: Some(user_id.to_owned()),
+        group_member_role: Some("owner".to_owned()),
+        group_id: Some("g1".to_owned()),
+        platform: "qq_official".to_owned(),
+        account_id: Some("app-1".to_owned()),
+        event_type: "FakeEvent".to_owned(),
+        ..crate::runtime::respond::RespondRequest::default()
+    }
 }
 
 #[test]
@@ -415,6 +446,95 @@ async fn todo_bulk_delete_confirm_keeps_items_whose_status_changed_after_pending
             .todo_store
             .get_by_id(&owner, &delete.id)
             .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn stable_group_todo_clarify_is_isolated_by_actor_interaction_session() {
+    let service = test_service();
+    let owner = TodoStore::owner(Some("u1"), stable_group_scope());
+    let item = service.todo_store.create(&owner, draft("买票")).unwrap();
+    let created_at = now_iso_cn();
+    let mut session = service
+        .session_store
+        .get_or_create_active(&stable_group_interaction_meta("u1"))
+        .unwrap();
+    session.pending_operation = Some(PendingOperation::TodoClarify {
+        initiator_user_id: Some("u1".to_owned()),
+        owner_key: owner.key.clone(),
+        request: PendingTodoClarification {
+            tool_name: "complete_todos".to_owned(),
+            arguments: json!({"numbers": null, "reference": "last"}),
+            allow_many: true,
+            error_code: "todo_reference_unavailable".to_owned(),
+            question: "请补充要操作哪条待办。".to_owned(),
+            candidates: vec![ClarificationCandidate {
+                id: item.id.clone(),
+                display_number: 1,
+                title: item.title.clone(),
+                status: item.status.clone(),
+            }],
+            created_at: created_at.clone(),
+        },
+        created_at,
+    });
+    service.session_store.save(&mut session).unwrap();
+
+    let other_number = service
+        .respond(stable_group_message("1", "u2"))
+        .await
+        .unwrap();
+    assert_ne!(
+        other_number.command.as_deref(),
+        Some("todo_clarify_resumed")
+    );
+    let other_cancel = service
+        .respond(stable_group_message("取消", "u2"))
+        .await
+        .unwrap();
+    assert_ne!(other_cancel.command.as_deref(), Some("todo_clarify_cancel"));
+    assert_eq!(
+        service
+            .todo_store
+            .get_by_id(&owner, &item.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        TodoStatus::Pending
+    );
+    assert!(
+        service
+            .session_store
+            .get_or_create_active(&stable_group_interaction_meta("u1"))
+            .unwrap()
+            .pending_operation
+            .is_some()
+    );
+
+    let owner_number = service
+        .respond(stable_group_message("1", "u1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        owner_number.command.as_deref(),
+        Some("todo_clarify_resumed")
+    );
+    assert_eq!(
+        service
+            .todo_store
+            .get_by_id(&owner, &item.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        TodoStatus::Completed
+    );
+    assert!(
+        service
+            .session_store
+            .get_or_create_active(&stable_group_interaction_meta("u1"))
+            .unwrap()
+            .pending_operation
             .is_none()
     );
 }
