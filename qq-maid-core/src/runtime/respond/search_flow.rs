@@ -1,6 +1,7 @@
 //! 联网搜索指令的处理流程。
-//! 负责解析 `/查` `/查询` `/search` 等指令，调用查询执行器进行联网搜索，
-//! 并格式化搜索结果回复。同时处理超时、配置缺失、上游异常等错误场景。
+//!
+//! `/查` `/查询` `/search` 只负责用户入口兼容、参数校验、session 记录和展示；
+//! 实际联网查询统一通过 `runtime/tools/search.rs` 中的 `web_search` Tool 执行。
 
 use std::{future::Future, pin::Pin};
 
@@ -11,8 +12,11 @@ use crate::{
     error::LlmError,
     runtime::{
         command::{ParsedCommand, parse_slash_command},
-        query::QueryRequest,
+        query::QueryOutcome,
         session::SessionRecord,
+        tools::{
+            WEB_SEARCH_QUERY_MAX_LENGTH, WEB_SEARCH_TOOL_NAME, WebSearchTool, WebSearchToolRequest,
+        },
     },
 };
 
@@ -24,13 +28,13 @@ use super::{
     },
 };
 
-// 联网搜索查询内容最大字符数限制
-const WEB_SEARCH_QUERY_MAX_LENGTH: usize = 200;
 // /查 指令的空参数用法提示
 const WEB_SEARCH_USAGE_REPLY: &str = "用法：/查 关键词（也可用 /查询 关键词 或 /search 关键词）
 例如：/查 Cloudflare D1 binding DB is not configured";
 // 查询超长时的提示
 const WEB_SEARCH_TOO_LONG_REPLY: &str = "查询内容太长了，请压缩到 200 字以内再试。";
+// Level 2 进度事件的兼容文本：用户可见，但不写入 session 或模型上下文。
+const WEB_SEARCH_RUNNING_DELTA: &str = "正在联网查询中…\n\n";
 // 搜索结果为空时的回复
 const WEB_SEARCH_EMPTY_RESULT_REPLY: &str = "【联网查询】
 
@@ -48,13 +52,57 @@ const WEB_SEARCH_UPSTREAM_ERROR_REPLY: &str = "【联网查询】
 
 联网查询服务暂时不可用，可能是上游接口、代理或网络配置异常。请稍后再试。";
 
+type WebSearchDeltaHandler<'a> = Box<
+    dyn FnMut(String) -> Pin<Box<dyn Future<Output = Result<(), LlmError>> + Send>> + Send + 'a,
+>;
+
+#[derive(Debug, Clone)]
+struct WebSearchToolOutput {
+    answer: String,
+    provider: String,
+    elapsed_ms: u64,
+}
+
 impl RustRespondService {
-    /// 处理联网搜索指令的主入口。校验参数、调用查询执行器、格式化结果或错误回复。
+    /// 处理联网搜索指令的主入口。校验参数、显式执行 `web_search` Tool、格式化结果或错误回复。
     pub(super) async fn handle_web_search_command(
         &self,
         command: ParsedCommand,
         req: &RespondRequest,
         session: &mut SessionRecord,
+    ) -> Result<RespondResponse, LlmError> {
+        self.handle_web_search_command_inner(command, req, session, false, None)
+            .await
+    }
+
+    /// `/查` 流式入口：通过 `WebSearchTool::query_stream` 转发真实搜索增量。
+    pub async fn handle_web_search_command_stream<F>(
+        &self,
+        command: ParsedCommand,
+        req: &RespondRequest,
+        session: &mut SessionRecord,
+        on_delta: F,
+    ) -> Result<RespondResponse, LlmError>
+    where
+        F: FnMut(String) -> Pin<Box<dyn Future<Output = Result<(), LlmError>> + Send>> + Send,
+    {
+        self.handle_web_search_command_inner(
+            command,
+            req,
+            session,
+            true,
+            Some(Box::new(on_delta) as WebSearchDeltaHandler<'_>),
+        )
+        .await
+    }
+
+    async fn handle_web_search_command_inner(
+        &self,
+        command: ParsedCommand,
+        req: &RespondRequest,
+        session: &mut SessionRecord,
+        stream: bool,
+        mut on_delta: Option<WebSearchDeltaHandler<'_>>,
     ) -> Result<RespondResponse, LlmError> {
         let query = command.argument.trim();
         if query.is_empty() {
@@ -73,25 +121,30 @@ impl RustRespondService {
         }
 
         let command_text = format!("/{} {}", command.raw_command, command.argument);
+        if stream && let Some(on_delta) = on_delta.as_mut() {
+            on_delta(WEB_SEARCH_RUNNING_DELTA.to_owned()).await?;
+        }
         let policy = self.resolve_agent_policy(req)?;
-        let outcome = match self
-            .query_executor
-            .query(QueryRequest {
-                query: query.to_owned(),
-                raw_question: Some(command_text.clone()),
-                max_results: None,
-                context_size: None,
-                model_override: Some(policy.search_model.clone()),
-            })
+        let output_result = if stream {
+            self.execute_web_search_tool_stream(
+                query,
+                &command_text,
+                Some(policy.search_model.clone()),
+                on_delta.as_mut(),
+            )
             .await
-        {
-            Ok(outcome) => outcome,
+        } else {
+            self.execute_web_search_tool(query, &command_text, Some(policy.search_model.clone()))
+                .await
+        };
+        let output = match output_result {
+            Ok(output) => output,
             Err(err) => {
                 tracing::warn!(
                     error_code = err.code,
                     error_stage = err.stage,
                     query_provider = self.query_executor.provider_name(),
-                    "web search command failed"
+                    "web search command tool failed"
                 );
                 let reply = format_web_search_error_reply(&err);
                 self.session_store
@@ -105,112 +158,16 @@ impl RustRespondService {
                     self.query_executor.provider_name().to_owned(),
                     Some(err.code.clone()),
                     Some(err.stage.clone()),
-                    false,
+                    stream,
                 );
                 return Ok(response);
             }
         };
-        let reply = if outcome.answer.trim().is_empty() {
+
+        let reply = if output.answer.trim().is_empty() {
             WEB_SEARCH_EMPTY_RESULT_REPLY.to_owned()
         } else {
-            format_web_search_command_reply(&outcome.answer)
-        };
-        self.session_store
-            .append_exchange(session, &command_text, &reply)
-            .map_err(session_error)?;
-
-        let response = build_web_search_success_response(
-            session.session_id.clone(),
-            command.action,
-            reply,
-            outcome.provider,
-            outcome.elapsed_ms,
-            false,
-        );
-        Ok(response)
-    }
-
-    /// `/查` 真流式路径：只消费执行器的 `query_stream`，不退回完整 `query()` 伪增量。
-    pub async fn handle_web_search_command_stream<F>(
-        &self,
-        command: ParsedCommand,
-        req: &RespondRequest,
-        session: &mut SessionRecord,
-        mut on_delta: F,
-    ) -> Result<RespondResponse, LlmError>
-    where
-        F: FnMut(String) -> Pin<Box<dyn Future<Output = Result<(), LlmError>> + Send>> + Send,
-    {
-        let query = command.argument.trim();
-        if query.is_empty() {
-            return Ok(command_response(
-                WEB_SEARCH_USAGE_REPLY,
-                Some(session.session_id.clone()),
-                Some(command.action),
-            ));
-        }
-        if query.chars().count() > WEB_SEARCH_QUERY_MAX_LENGTH {
-            return Ok(command_response(
-                WEB_SEARCH_TOO_LONG_REPLY,
-                Some(session.session_id.clone()),
-                Some(command.action),
-            ));
-        }
-
-        let command_text = format!("/{} {}", command.raw_command, command.argument);
-        let policy = self.resolve_agent_policy(req)?;
-        let (delta_tx, mut delta_rx) = mpsc::channel(16);
-        let query_executor = self.query_executor.clone();
-        let query_req = QueryRequest {
-            query: query.to_owned(),
-            raw_question: Some(command_text.clone()),
-            max_results: None,
-            context_size: None,
-            model_override: Some(policy.search_model.clone()),
-        };
-        let query_task =
-            tokio::spawn(async move { query_executor.query_stream(query_req, delta_tx).await });
-        while let Some(delta) = delta_rx.recv().await {
-            if !delta.is_empty()
-                && let Err(err) = on_delta(delta).await
-            {
-                // 接收方取消时必须停止继续 poll provider stream，而不是只停止转发。
-                query_task.abort();
-                return Err(err);
-            }
-        }
-        let outcome = match query_task.await.map_err(|err| {
-            LlmError::provider(format!("web search stream task failed: {err}"), "internal")
-        })? {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                tracing::warn!(
-                    error_code = err.code,
-                    error_stage = err.stage,
-                    query_provider = self.query_executor.provider_name(),
-                    "web search stream command failed"
-                );
-                let reply = format_web_search_error_reply(&err);
-                self.session_store
-                    .append_exchange(session, &command_text, &reply)
-                    .map_err(session_error)?;
-
-                let response = build_web_search_response(
-                    session.session_id.clone(),
-                    command.action.clone(),
-                    reply,
-                    self.query_executor.provider_name().to_owned(),
-                    Some(err.code.clone()),
-                    Some(err.stage.clone()),
-                    true,
-                );
-                return Ok(response);
-            }
-        };
-        let reply = if outcome.answer.trim().is_empty() {
-            WEB_SEARCH_EMPTY_RESULT_REPLY.to_owned()
-        } else {
-            format_web_search_command_reply(&outcome.answer)
+            format_web_search_command_reply(&output.answer)
         };
         self.session_store
             .append_exchange(session, &command_text, &reply)
@@ -220,10 +177,66 @@ impl RustRespondService {
             session.session_id.clone(),
             command.action,
             reply,
-            outcome.provider,
-            outcome.elapsed_ms,
-            true,
+            output.provider,
+            output.elapsed_ms,
+            stream,
         ))
+    }
+
+    async fn execute_web_search_tool(
+        &self,
+        query: &str,
+        raw_question: &str,
+        model_override: Option<String>,
+    ) -> Result<WebSearchToolOutput, LlmError> {
+        let tool = WebSearchTool::new(self.query_executor.clone());
+        let outcome = tool
+            .query(WebSearchToolRequest {
+                query: query.to_owned(),
+                raw_question: Some(raw_question.to_owned()),
+                max_results: None,
+                context_size: None,
+                model_override,
+            })
+            .await?;
+        Ok(web_search_output_from_outcome(outcome))
+    }
+
+    async fn execute_web_search_tool_stream(
+        &self,
+        query: &str,
+        raw_question: &str,
+        model_override: Option<String>,
+        on_delta: Option<&mut WebSearchDeltaHandler<'_>>,
+    ) -> Result<WebSearchToolOutput, LlmError> {
+        let (delta_tx, mut delta_rx) = mpsc::channel(16);
+        let tool = WebSearchTool::new(self.query_executor.clone());
+        let request = WebSearchToolRequest {
+            query: query.to_owned(),
+            raw_question: Some(raw_question.to_owned()),
+            max_results: None,
+            context_size: None,
+            model_override,
+        };
+        let query_task = tokio::spawn(async move { tool.query_stream(request, delta_tx).await });
+        let mut on_delta = on_delta;
+        while let Some(delta) = delta_rx.recv().await {
+            if !delta.is_empty()
+                && let Some(handler) = on_delta.as_mut()
+                && let Err(err) = handler(delta).await
+            {
+                query_task.abort();
+                return Err(err);
+            }
+        }
+        let outcome = query_task.await.map_err(|err| {
+            LlmError::provider(format!("web search stream task failed: {err}"), "internal")
+        })??;
+        Ok(WebSearchToolOutput {
+            answer: outcome.answer,
+            provider: outcome.provider,
+            elapsed_ms: outcome.elapsed_ms,
+        })
     }
 }
 
@@ -259,7 +272,7 @@ fn parse_compact_web_search_command(text: &str) -> Option<ParsedCommand> {
     None
 }
 
-fn format_web_search_command_reply(answer: &str) -> String {
+pub(super) fn format_web_search_command_reply(answer: &str) -> String {
     let mut text = answer.trim().to_owned();
     if text.is_empty() {
         text = "没查到明确结果。可以换一个关键词再试。".to_owned();
@@ -270,11 +283,19 @@ fn format_web_search_command_reply(answer: &str) -> String {
     truncate_chars(&text, 1500)
 }
 
-fn format_web_search_error_reply(err: &LlmError) -> String {
+pub(super) fn format_web_search_error_reply(err: &LlmError) -> String {
     match err.code.as_str() {
         "config" => WEB_SEARCH_CONFIG_ERROR_REPLY.to_owned(),
         "timeout" => WEB_SEARCH_TIMEOUT_REPLY.to_owned(),
         _ => WEB_SEARCH_UPSTREAM_ERROR_REPLY.to_owned(),
+    }
+}
+
+fn web_search_output_from_outcome(outcome: QueryOutcome) -> WebSearchToolOutput {
+    WebSearchToolOutput {
+        answer: outcome.answer,
+        provider: outcome.provider,
+        elapsed_ms: outcome.elapsed_ms,
     }
 }
 
@@ -299,6 +320,7 @@ fn build_web_search_response(
         "used_memory": false,
         "used_search": true,
         "query_provider": query_provider,
+        "search_tool": WEB_SEARCH_TOOL_NAME,
     });
     if let Some(code) = query_error_code {
         diagnostics["query_error_code"] = json!(code);
@@ -331,6 +353,7 @@ fn build_web_search_success_response(
         "used_search": true,
         "query_provider": query_provider,
         "query_elapsed_ms": query_elapsed_ms,
+        "search_tool": WEB_SEARCH_TOOL_NAME,
     }));
     response
 }
