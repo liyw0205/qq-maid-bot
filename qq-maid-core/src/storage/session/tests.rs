@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::pending::PendingMemory;
+use crate::storage::todo::TodoItemDraft;
 use uuid::Uuid;
 
 fn test_store() -> SessionStore {
@@ -17,6 +17,37 @@ fn test_meta() -> SessionMeta {
         None,
         "qq_official",
     )
+}
+
+fn write_pending_json_for_test(store: &SessionStore, session_id: &str, pending_json: &str) {
+    let conn = store.connection().unwrap();
+    conn.execute(
+        "UPDATE sessions SET pending_operation_json = ?1 WHERE session_id = ?2",
+        params![pending_json, session_id],
+    )
+    .unwrap();
+}
+
+fn pending_todo_add(title: &str) -> PendingOperation {
+    PendingOperation::TodoAdd {
+        initiator_user_id: Some("u1".to_owned()),
+        owner_key: "u1".to_owned(),
+        draft: TodoItemDraft {
+            title: title.to_owned(),
+            detail: None,
+            raw_text: Some(title.to_owned()),
+            due_date: None,
+            due_at: None,
+            reminder_at: None,
+            time_precision: Default::default(),
+            recurrence_kind: Default::default(),
+            recurrence_interval_days: 0,
+            recurrence_interval: 0,
+            recurrence_unit: Default::default(),
+        },
+        allow_revision: false,
+        created_at: now_iso_cn(),
+    }
 }
 
 #[test]
@@ -47,18 +78,7 @@ fn reset_keeps_session_but_clears_context() {
     let mut session = store.create(&meta, "话题", true).unwrap();
     session.summary = "摘要".to_owned();
     session.append_message("user", "hi");
-    session.pending_operation = Some(PendingOperation::MemoryCreate {
-        initiator_user_id: Some("u1".to_owned()),
-        memory: PendingMemory {
-            content: "新记忆".to_owned(),
-            source_text: "/memory 新记忆".to_owned(),
-            memory_type: "note".to_owned(),
-            scope: "general".to_owned(),
-            created_at: now_iso_cn(),
-            target_scope_type: Some("personal".to_owned()),
-            target_scope_id: Some("u1".to_owned()),
-        },
-    });
+    session.pending_operation = Some(pending_todo_add("新待办"));
 
     session.reset();
     store.save(&mut session).unwrap();
@@ -179,18 +199,7 @@ fn sqlite_reopen_restores_pending_and_last_queries() {
     let meta = test_meta();
     let store = SessionStore::new(SqliteDatabase::open(&path, SESSION_MIGRATIONS).unwrap());
     let mut session = store.create(&meta, "跨进程状态", true).unwrap();
-    session.pending_operation = Some(PendingOperation::MemoryCreate {
-        initiator_user_id: Some("u1".to_owned()),
-        memory: PendingMemory {
-            content: "需要确认的记忆".to_owned(),
-            source_text: "/memory 需要确认的记忆".to_owned(),
-            memory_type: "note".to_owned(),
-            scope: "general".to_owned(),
-            created_at: now_iso_cn(),
-            target_scope_type: Some("personal".to_owned()),
-            target_scope_id: Some("u1".to_owned()),
-        },
-    });
+    session.pending_operation = Some(pending_todo_add("需要确认的待办"));
     session.last_todo_query = Some(LastTodoQuery {
         owner_key: "u1".to_owned(),
         query_type: "pending".to_owned(),
@@ -227,6 +236,51 @@ fn sqlite_reopen_restores_pending_and_last_queries() {
 }
 
 #[test]
+fn legacy_memory_pending_json_loads_as_no_pending() {
+    for kind in ["memory_create", "memory_update", "memory_delete"] {
+        let store = test_store();
+        let meta = test_meta();
+        let session = store.create(&meta, "旧 memory pending", true).unwrap();
+        write_pending_json_for_test(
+            &store,
+            &session.session_id,
+            &serde_json::json!({
+                "kind": kind,
+                "created_at": now_iso_cn(),
+                "payload": {"ignored": true}
+            })
+            .to_string(),
+        );
+
+        let reloaded = store.get_or_create_active(&meta).unwrap();
+
+        assert_eq!(reloaded.session_id, session.session_id, "kind={kind}");
+        assert!(reloaded.pending_operation.is_none(), "kind={kind}");
+    }
+}
+
+#[test]
+fn unknown_or_broken_pending_json_still_reports_decode_error() {
+    let store = test_store();
+    let meta = test_meta();
+    let session = store.create(&meta, "未知 pending", true).unwrap();
+    write_pending_json_for_test(
+        &store,
+        &session.session_id,
+        r#"{"kind":"unknown_pending","created_at":"2026-07-01T00:00:00+08:00"}"#,
+    );
+
+    let err = store.get_or_create_active(&meta).unwrap_err();
+    assert_eq!(err.code(), "decode_error");
+    assert!(err.message().contains("pending operation"));
+
+    write_pending_json_for_test(&store, &session.session_id, "{");
+    let err = store.get_or_create_active(&meta).unwrap_err();
+    assert_eq!(err.code(), "decode_error");
+    assert!(err.message().contains("pending operation"));
+}
+
+#[test]
 fn append_exchange_with_latest_merges_query_snapshot_without_overwriting_newer_fields() {
     let store = test_store();
     let meta = test_meta();
@@ -235,18 +289,7 @@ fn append_exchange_with_latest_merges_query_snapshot_without_overwriting_newer_f
     store.save(&mut stale).unwrap();
 
     let mut latest = store.get_or_create_active(&meta).unwrap();
-    latest.pending_operation = Some(PendingOperation::MemoryCreate {
-        initiator_user_id: Some("u1".to_owned()),
-        memory: PendingMemory {
-            content: "较新的 pending".to_owned(),
-            source_text: "/memory 较新的 pending".to_owned(),
-            memory_type: "note".to_owned(),
-            scope: "general".to_owned(),
-            created_at: now_iso_cn(),
-            target_scope_type: Some("personal".to_owned()),
-            target_scope_id: Some("u1".to_owned()),
-        },
-    });
+    latest.pending_operation = Some(pending_todo_add("较新的 pending"));
     latest.last_todo_action = Some(LastTodoAction {
         owner_key: "group:g1".to_owned(),
         item_id: "todo-new".to_owned(),
