@@ -7,7 +7,9 @@ use std::{
     time::Duration,
 };
 
-use qq_maid_common::identity_context::IdentitySource;
+use qq_maid_common::identity_context::{
+    IdentitySource, MentionConfidence, MentionIdentity, MessageActorContext,
+};
 
 use crate::{
     app::{CoreExecutors, CoreRuntimeState, CoreStores},
@@ -289,6 +291,34 @@ impl QueryExecutor for EmptyQueryExecutor {
     }
 }
 
+#[derive(Clone, Default)]
+pub(super) struct MockQueryExecutor {
+    requests: Arc<Mutex<Vec<QueryRequest>>>,
+}
+
+impl MockQueryExecutor {
+    pub(super) fn requests(&self) -> Vec<QueryRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl QueryExecutor for MockQueryExecutor {
+    async fn query(&self, req: QueryRequest) -> Result<QueryOutcome, LlmError> {
+        self.requests.lock().unwrap().push(req.clone());
+        Ok(QueryOutcome {
+            answer: format!("web answer: {}", req.query),
+            sources: Vec::new(),
+            provider: "mock-query".to_owned(),
+            elapsed_ms: 1,
+        })
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "mock-query"
+    }
+}
+
 struct EmptyWeatherExecutor;
 
 #[async_trait::async_trait]
@@ -381,6 +411,18 @@ pub(super) fn group_request(text: &str) -> CoreRequest {
     }
 }
 
+/// 构造命中 `@当前机器人` mention 的群聊请求，用于验证群聊显式 WebSearch 路径。
+pub(super) fn group_request_with_self_mention(text: &str) -> CoreRequest {
+    let mut request = group_request(text);
+    request.mentions = vec![MentionIdentity {
+        raw_text: Some("@当前机器人".to_owned()),
+        target: MessageActorContext::default(),
+        is_self: true,
+        confidence: MentionConfidence::Event,
+    }];
+    request
+}
+
 pub(super) fn wechat_service_request(text: &str) -> CoreRequest {
     CoreRequest {
         text: text.to_owned(),
@@ -450,6 +492,36 @@ pub(super) fn test_state_with_group_tool_calling(
     request_timeout_seconds: u64,
     tool_calling_enabled: bool,
     tool_calling_group_enabled: bool,
+) -> CoreRuntimeState {
+    test_state_with_group_tool_calling_and_query_executor(
+        provider,
+        request_timeout_seconds,
+        tool_calling_enabled,
+        tool_calling_group_enabled,
+        Arc::new(EmptyQueryExecutor),
+    )
+}
+
+pub(super) fn test_state_with_query_executor(
+    provider: TestProvider,
+    request_timeout_seconds: u64,
+    query_executor: Arc<dyn QueryExecutor>,
+) -> CoreRuntimeState {
+    test_state_with_group_tool_calling_and_query_executor(
+        provider,
+        request_timeout_seconds,
+        false,
+        false,
+        query_executor,
+    )
+}
+
+fn test_state_with_group_tool_calling_and_query_executor(
+    provider: TestProvider,
+    request_timeout_seconds: u64,
+    tool_calling_enabled: bool,
+    tool_calling_group_enabled: bool,
+    query_executor: Arc<dyn QueryExecutor>,
 ) -> CoreRuntimeState {
     let base_dir = std::env::temp_dir().join(format!(
         "qq-maid-core-service-test-{}",
@@ -549,7 +621,7 @@ pub(super) fn test_state_with_group_tool_calling(
         provider: observe_provider(Arc::new(provider), upstream_status.clone()),
         upstream_status,
         executors: CoreExecutors {
-            query_executor: Arc::new(EmptyQueryExecutor),
+            query_executor,
             weather_executor: Arc::new(EmptyWeatherExecutor),
             train_executor: Arc::new(EmptyTrainExecutor),
             radar_executor: Arc::new(EmptyRadarExecutor),
