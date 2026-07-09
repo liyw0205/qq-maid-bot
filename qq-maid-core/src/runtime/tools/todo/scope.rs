@@ -7,8 +7,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use std::sync::Arc;
-
 use qq_maid_llm::tool::{ToolContext, ToolOutput};
 
 use crate::{
@@ -27,6 +25,7 @@ use crate::{
     },
 };
 
+use super::common::MANAGE_RECURRING_REMINDER_TOOL_NAME;
 use super::common::{
     PREBOUND_EDIT_DRAFT_KEY, PREBOUND_ERROR_OUTPUT_KEY, PREBOUND_SELECTION_KEY,
     PREBOUND_SINGLE_ID_KEY, PREBOUND_SINGLE_LABEL_KEY, TODO_DEDUP_HISTORY_KEY,
@@ -35,17 +34,7 @@ use super::common::{
     TodoToolDedupEntry, session_tool_error, todo_tool_error, todo_tool_error_output,
 };
 
-/// 受限 Tool Loop / 引用消息专属的请求级选择作用域。
-///
-/// 该作用域是运行时内存态覆盖，由澄清恢复或引用消息路径在构造 TodoTool 实例时注入，
-/// **不写入 Session / 数据库 / 全局共享状态**。`resolve_numbers` 优先用它把模型
-/// 给的 `numbers=[n]` 映射到本次可见快照；引用快照存在但校验失败时会注入
-/// `Blocked`，明确禁止 fallback 到 `last_todo_query`，避免跨 owner/account 误操作。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SelectionScope {
-    Scoped(Arc<[String]>),
-    Blocked,
-}
+pub(crate) use crate::runtime::visible_entity::VisibleEntitySelectionScope as SelectionScope;
 
 const TODO_TASK_QUERY_HISTORY_KEY: &str = "tool_todo_task_query_history";
 const TODO_TASK_QUERY_HISTORY_LIMIT: usize = 16;
@@ -651,7 +640,9 @@ impl TodoToolScope {
 
         self.ensure_no_pending()?;
         let candidates = match tool_name {
-            COMPLETE_TODOS_TOOL_NAME | EDIT_TODO_TOOL_NAME => {
+            COMPLETE_TODOS_TOOL_NAME
+            | EDIT_TODO_TOOL_NAME
+            | MANAGE_RECURRING_REMINDER_TOOL_NAME => {
                 clarification_candidates_from(todo_store, &self.owner, false)
                     .map_err(todo_tool_error)?
             }
