@@ -190,9 +190,12 @@ impl RustRespondService {
             status_subject: respond_route.status_hint.map(|hint| hint.subject.as_str()),
             status_action: respond_route.status_hint.map(|hint| hint.action.as_str()),
         };
+        let mut agent_finalization_error = None;
+        let mut agent_exposed_tools = Vec::new();
         let (output, agent_turn_outcome, tool_turn_diagnostics) = if use_agent_runtime {
-            let tools = self.tool_runtime.registry_for_chat(&policy, &req)?;
-            let output = service
+            let (tools, exposed_tools) = self.tool_runtime.registry_for_chat(&policy, &req)?;
+            agent_exposed_tools = exposed_tools;
+            let output = match service
                 .respond_with_tools(
                     chat_req,
                     tools,
@@ -201,7 +204,29 @@ impl RustRespondService {
                     final_delta_sink,
                     run_handle,
                 )
-                .await?;
+                .await
+            {
+                Ok(output) => output,
+                Err(err) => {
+                    let Some(output) = self
+                        .tool_runtime
+                        .recover_output_after_agent_failure(&err, &policy.main_model)
+                    else {
+                        return Err(err);
+                    };
+                    tracing::warn!(
+                        error_code = %err.code,
+                        error_stage = %err.stage,
+                        agent_executed_tools = ?err
+                            .agent
+                            .as_deref()
+                            .map(|agent| &agent.executed_tools),
+                        "agent final reply failed after verified tool execution; using domain fallback"
+                    );
+                    agent_finalization_error = Some(err.as_info());
+                    output
+                }
+            };
 
             let mut latest_session = self
                 .session_store
@@ -243,6 +268,7 @@ impl RustRespondService {
 
         let reply = output.reply.clone();
         let executed_tools = output.agent.executed_tools.clone();
+        let used_search = executed_tools.iter().any(|tool| tool == "web_search");
         let tool_call_emitted = !output.agent.emitted_tools.is_empty();
         let tool_execution_attempted = output.agent.tool_execution_attempted;
         let agent_model_rounds = output.agent.model_rounds;
@@ -284,7 +310,7 @@ impl RustRespondService {
             "used_memory": used_memory,
             "used_knowledge": used_knowledge,
             "knowledge_hit_count": knowledge_context.hit_count,
-            "used_search": false,
+            "used_search": used_search,
             "respond_route": respond_route.route.as_str(),
             "route_reason": respond_route.reason,
             "route_domains": respond_route.domains(),
@@ -297,11 +323,23 @@ impl RustRespondService {
             "stop_reason": agent_result,
             "tool_calling_enabled": use_agent_runtime,
             "agent_mode": if use_agent_runtime { json!("configured_whitelist") } else { Value::Null },
-            "agent_enabled_tools": if use_agent_runtime { json!(&policy.enabled_tools) } else { Value::Null },
+            "agent_configured_tools": if use_agent_runtime { json!(&policy.enabled_tools) } else { Value::Null },
+            "agent_exposed_tools": if use_agent_runtime { json!(&agent_exposed_tools) } else { Value::Null },
+            // 保留旧字段兼容现有 diagnostics 消费方，但语义修正为本轮实际暴露集合。
+            "agent_enabled_tools": if use_agent_runtime { json!(&agent_exposed_tools) } else { Value::Null },
             "agent_policy": policy.diagnostic_summary(),
             "agent_executed_tools": executed_tools,
             "agent_model_rounds": agent_model_rounds,
             "agent_streaming_fallback_used": agent_streaming_fallback_used,
+            "agent_finalization_fallback_used": agent_finalization_error.is_some(),
+            "agent_finalization_error_code": agent_finalization_error
+                .as_ref()
+                .map(|error| json!(&error.code))
+                .unwrap_or(Value::Null),
+            "agent_finalization_error_stage": agent_finalization_error
+                .as_ref()
+                .map(|error| json!(&error.stage))
+                .unwrap_or(Value::Null),
             "agent_tool_results": agent_tool_results,
             "agent_turn_status": agent_diagnostics["agent_turn_status"].clone(),
             "tool_outcomes": agent_diagnostics["tool_outcomes"].clone(),

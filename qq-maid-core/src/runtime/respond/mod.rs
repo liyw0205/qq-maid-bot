@@ -4,7 +4,7 @@
 //! 发来的 `RespondRequest`，根据请求类型和会话状态将其分派到对应的子处理
 //! 模块（聊天、翻译、待办、记忆、天气、搜索、会话管理），最终返回 `RespondResponse`。
 
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use qq_maid_llm::{
     agent_loop::ToolLoopProgressSink, context_budget::ContextBudgetConfig,
@@ -134,6 +134,8 @@ pub struct RespondServiceOptions {
     pub context_budget: ContextBudgetConfig,
     /// 单项 Tool 输出最大字符数，单独注入 ToolRegistry，不混入上下文预算。
     pub tool_result_max_chars: usize,
+    /// Agent `web_search` 等待首个非空搜索增量的超时。
+    pub web_search_first_activity_timeout: Duration,
     /// 私聊状态提示使用的前台称呼。
     pub status_display_name: String,
     /// 统一 Agent 场景策略。
@@ -150,11 +152,10 @@ pub(crate) enum RespondPlan {
     CommandEvent,
     StreamingChat,
     AgentChat,
-    /// 显式联网查询路径：`/查` 或明确对机器人发起的搜索意图。
+    /// 显式联网查询路径，仅用于 `/查`、`/查询`、`/search` 等专用入口。
     ///
-    /// 该路径独立于 Agent Chat 路由：群聊只要 @ 机器人并命中搜索意图即触发，
-    /// 不依赖 Tool Loop 开关；查询复用 `/查` 的 `WebSearchTool::query_stream`
-    /// 流式能力，避免长时间非流式阻塞导致超时。
+    /// 普通自然语言搜索请求进入 AgentChat，由模型结合上下文决定是否调用
+    /// `web_search`；显式命令继续复用原有流式查询和错误处理能力。
     WebSearch,
 }
 
@@ -321,6 +322,7 @@ impl RustRespondService {
             options.rss_summary_max_chars,
             options.rss_seen_retention,
             options.tool_result_max_chars,
+            options.web_search_first_activity_timeout,
         );
         Self {
             provider,
@@ -502,11 +504,9 @@ impl RustRespondService {
 
     /// `RespondPlan::WebSearch` 的流式编放入口。
     ///
-    /// 当 plan 已被 router 判定为 WebSearch 时调用：显式 `/查` 走原有
-    /// `handle_web_search_command_stream`；自然语言搜索意图（如“联网查询下今日 ai 新闻”
-    /// ）不再退化成普通聊天，而是合成查询并复用 `WebSearchTool::query_stream`，
-    /// 避免长时间非流式阻塞导致业务超时。会话加载与 pending 优先级沿用 `respond_stream`，
-    /// 不重复各自重建状态机。
+    /// 当显式 `/查` 等命令被 router 判定为 WebSearch 时调用，复用
+    /// `handle_web_search_command_stream` 的查询、流式输出和错误处理。会话加载与
+    /// pending 优先级沿用 `respond_stream`，不重复各自重建状态机。
     pub(crate) async fn respond_web_search_stream<F>(
         &self,
         req: RespondRequest,
@@ -561,7 +561,13 @@ impl RustRespondService {
                 .map_err(session_error)?,
         };
 
-        let command = search_flow::web_search_command_for_plan(&user_text);
+        let command = search_flow::parse_web_search_command(&user_text).ok_or_else(|| {
+            LlmError::new(
+                "web_search_command_missing",
+                "web search plan requires an explicit search command",
+                "router",
+            )
+        })?;
         self.handle_web_search_command_stream(command, &req, &mut session, on_delta)
             .await
     }

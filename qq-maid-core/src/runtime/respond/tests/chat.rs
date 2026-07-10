@@ -1,9 +1,13 @@
-use std::{fs, sync::Arc};
+use std::fs;
 
 use qq_maid_llm::provider::{ToolCallingProtocol, ToolExecutionResult, types::ChatRole};
 use serde_json::Value;
 
-use crate::runtime::respond::{PlannedRespond, RespondPlan};
+use crate::runtime::respond::{
+    PlannedRespond, RespondPlan,
+    agent_route::{RespondRoute, SemanticRoute, ToolDomain},
+    status_hint::{StatusAction, StatusHint, StatusSubject},
+};
 
 use super::{
     super::{
@@ -124,6 +128,7 @@ async fn private_general_chat_with_tool_capability_uses_agent_direct_answer() {
     assert_eq!(diagnostics["tool_calling_enabled"], serde_json::json!(true));
     assert_eq!(diagnostics["tool_calling_available"], true);
     assert_eq!(diagnostics["tool_calling_used"], false);
+    assert_eq!(diagnostics["used_search"], false);
     assert_eq!(diagnostics["agent_result"], "direct_answer");
     assert_eq!(diagnostics["agent_executed_tools"], serde_json::json!([]));
     assert_eq!(diagnostics["agent_model_rounds"], 1);
@@ -134,14 +139,14 @@ async fn private_general_chat_with_tool_capability_uses_agent_direct_answer() {
 }
 
 #[tokio::test]
-async fn rejected_tool_call_is_not_reported_as_direct_answer() {
+async fn rejected_web_search_call_is_not_reported_as_used_search() {
     let inspector = MockProvider::new()
         .with_tool_protocol(ToolCallingProtocol::OpenAiResponses)
-        .with_rejected_tool_call("unknown_tool", "这个工具不可用。");
+        .with_rejected_tool_call("web_search", "搜索参数无效。");
     let service = test_service_with_provider_and_tool_calling(inspector, true);
 
     let response = service
-        .respond(private_message("尝试一个不存在的工具"))
+        .respond(private_message("尝试联网搜索"))
         .await
         .unwrap();
 
@@ -149,6 +154,7 @@ async fn rejected_tool_call_is_not_reported_as_direct_answer() {
     assert_eq!(diagnostics["tool_calling_available"], true);
     assert_eq!(diagnostics["tool_call_emitted"], true);
     assert_eq!(diagnostics["tool_execution_attempted"], true);
+    assert_eq!(diagnostics["used_search"], false);
     assert_eq!(diagnostics["agent_executed_tools"], serde_json::json!([]));
     assert_eq!(diagnostics["agent_result"], "rejected");
     assert_eq!(diagnostics["stop_reason"], "rejected");
@@ -644,14 +650,28 @@ async fn group_tool_loop_exposes_rss_management_but_not_todo_when_enabled() {
 }
 
 #[tokio::test]
-async fn private_search_intent_routes_to_web_search_plan() {
-    let service = test_service_with_provider_and_tool_calling(MockProvider::new(), true);
+async fn private_natural_search_intent_routes_to_agent_chat_with_search_semantics() {
+    let provider = MockProvider::new().with_tool_protocol(ToolCallingProtocol::OpenAiResponses);
+    let service = test_service_with_provider_and_tool_calling(provider, true);
 
-    // 普通聊天命中搜索意图且明确对机器人发起（私聊天然为真）时，
-    // 不再进入 Tool Loop，而是走显式 WebSearch 流式路径。
-    for input in ["联网查询下今日 ai 新闻", "查一下今天 AI 新闻"] {
-        let plan = service.plan_core_respond(&private_message(input)).unwrap();
-        assert_eq!(plan, RespondPlan::WebSearch, "{input}");
+    for input in ["联网查一下", "联网查询下今日 ai 新闻", "查一下今天 AI 新闻"]
+    {
+        let planned = service.plan_core_respond(&private_message(input)).unwrap();
+        assert_eq!(planned, RespondPlan::AgentChat, "{input}");
+
+        let decision = planned.respond_route().unwrap();
+        assert_eq!(decision.route, RespondRoute::AgentChat, "{input}");
+        assert_eq!(
+            decision.semantic_route,
+            SemanticRoute::ToolIntent,
+            "{input}"
+        );
+        assert_eq!(decision.domain, ToolDomain::Search, "{input}");
+        assert_eq!(
+            decision.status_hint,
+            Some(StatusHint::new(StatusSubject::Tool, StatusAction::Query)),
+            "{input}"
+        );
     }
 }
 
@@ -670,49 +690,11 @@ Codex 分析结果：
 }
 
 #[tokio::test]
-async fn private_search_intent_web_search_stream_reuses_query_stream() {
-    let deltas = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let collected = deltas.clone();
-    let service = test_service_with_provider_and_tool_calling(MockProvider::new(), true);
-
-    let response = service
-        .respond_web_search_stream(
-            private_message("联网查询下今日 ai 新闻"),
-            move |delta| {
-                let collected = collected.clone();
-                Box::pin(async move {
-                    collected.lock().unwrap().push(delta);
-                    Ok(())
-                })
-            },
-        )
-        .await
-        .unwrap();
-
-    // 复用 `/查` 的流式查询：先发 “正在联网查询中…” 进度，再发结果。
-    let received = deltas.lock().unwrap().clone();
-    assert!(
-        received
-            .first()
-            .is_some_and(|delta| delta.contains("正在联网查询中"))
-    );
-    assert!(
-        received
-            .iter()
-            .any(|delta| delta.contains("联网查询下今日 ai 新闻"))
-    );
-    let text = response.text.as_deref().unwrap();
-    assert!(text.starts_with("【联网查询】"));
-    assert!(text.contains("联网查询下今日 ai 新闻"));
-    assert_eq!(response.command.as_deref(), Some("web_search"));
-}
-
-#[tokio::test]
 async fn private_explicit_search_command_routes_to_web_search_plan() {
     let service = test_service_with_provider_and_tool_calling(MockProvider::new(), true);
 
     let plan = service
-        .plan_core_respond(&private_message("/查 今日 ai 新闻"))
+        .plan_core_respond(&private_message("/查 台风巴威"))
         .unwrap();
     assert_eq!(plan, RespondPlan::WebSearch);
 }
@@ -801,7 +783,7 @@ async fn last_reference_rejects_owner_mismatch_and_missing_todo() {
         .unwrap();
 
     service
-        .respond(private_message("杭州今天要带伞吗"))
+        .respond(private_message("恢复刚才完成的待办"))
         .await
         .unwrap();
     let tool_request = inspector.tool_requests().remove(0);
@@ -2503,6 +2485,89 @@ async fn todo_internal_list_before_write_is_not_user_visible_query() {
     assert_eq!(snapshot.query_type, "list");
     assert_eq!(snapshot.result_ids.len(), 1);
     assert_eq!(inspector.tool_call_count(), 1);
+}
+
+#[tokio::test]
+async fn todo_write_result_is_returned_when_final_agent_round_fails() {
+    let inspector = MockProvider::new()
+        .with_tool_protocol(ToolCallingProtocol::OpenAiResponses)
+        .with_tool_calls_then_error(
+            vec![(
+                "complete_todos",
+                r#"{"numbers":[1],"selection_text":null,"reference":null}"#,
+            )],
+            crate::error::LlmError::new(
+                "context_budget_exceeded",
+                "tool loop context budget exceeded",
+                "tool_loop",
+            ),
+        );
+    let service = test_service_with_provider_and_tool_calling(inspector.clone(), true);
+    let owner = TodoStore::owner(Some("u1"), "private:u1");
+    let todo = service
+        .task_store
+        .create(
+            &owner,
+            TodoItemDraft {
+                title: "确认线上回执".to_owned(),
+                detail: None,
+                raw_text: None,
+                due_date: None,
+                due_at: None,
+                reminder_at: None,
+                time_precision: TodoTimePrecision::None,
+                recurrence_kind: crate::runtime::tools::todo::TodoRecurrenceKind::None,
+                recurrence_interval_days: 0,
+                recurrence_interval: 0,
+                recurrence_unit: crate::runtime::tools::todo::TodoRecurrenceUnit::Day,
+            },
+        )
+        .unwrap();
+
+    service.respond(private_message("/todo")).await.unwrap();
+    let response = service
+        .respond(private_message("完成第一条待办"))
+        .await
+        .unwrap();
+
+    assert!(response.ok);
+    assert!(
+        response
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("✅ 已完成待办") && text.contains("确认线上回执"))
+    );
+    let diagnostics = response.diagnostics.unwrap();
+    assert_eq!(diagnostics["agent_finalization_fallback_used"], true);
+    assert_eq!(
+        diagnostics["agent_finalization_error_code"],
+        "context_budget_exceeded"
+    );
+    assert_eq!(
+        diagnostics["agent_executed_tools"],
+        serde_json::json!(["complete_todos"])
+    );
+    assert_eq!(inspector.tool_call_count(), 1);
+    assert!(service.task_store.list_pending(&owner).unwrap().is_empty());
+    assert_eq!(
+        service
+            .task_store
+            .list_completed(&owner)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![todo.id]
+    );
+
+    let exposed_tools = inspector.tool_requests()[0]
+        .tools
+        .metadata()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    assert!(exposed_tools.contains(&"complete_todos".to_owned()));
+    assert!(!exposed_tools.contains(&"restore_todos".to_owned()));
 }
 
 #[tokio::test]
