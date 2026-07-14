@@ -72,17 +72,48 @@ vim config/.env
 
 最少需要配置一个入口渠道，以及至少一个 Provider 的 API Key。使用 QQ 官方入口时同时填写 `QQ_BOT_APP_ID`、`QQ_BOT_APP_SECRET`；微信-only 或 OneBot 11 部署可留空两项并启用对应入口。
 
+### Windows 原生使用
+
+从 Releases 下载 `windows-x86_64.zip` 并解压，在 PowerShell 中进入解压后的目录：
+
+```powershell
+Copy-Item .\.env.example .\config\.env
+notepad .\config\.env
+
+.\botctl.cmd start
+.\botctl.cmd status
+.\botctl.cmd health
+.\botctl.cmd logs
+```
+
+停止或重启：
+
+```powershell
+.\botctl.cmd stop
+.\botctl.cmd restart
+```
+
+`botctl.cmd` 是免调整执行策略的便捷入口，实际调用同目录的原生 PowerShell 控制脚本。也可以直接运行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\botctl.ps1 status
+```
+
+登录后自动启动可使用发布包内的 `windows-startup-example.bat`，具体配置见
+[Windows 登录后启动](./runtime/README.md#windows-登录后启动)。当前 Release 只发布 Windows x86_64；
+ARM64 Windows 不依赖未经验证的 x64 模拟能力，可改在 WSL 中安装对应 Linux Release。WSL 始终按
+Linux 环境识别。
+
 Windows 用户也可以在 Git Bash、MSYS2 或 Cygwin 中执行 `bash qbot.sh install`，脚本会自动下载
-`windows-x86_64.zip` 并默认安装到 `$HOME/qq-maid-bot`。原生 Windows 启动方式参见发布包内的
-`windows-startup-example.bat`。目前 Release 只发布 Windows x86_64；ARM64 Windows Shell 会在下载前
-明确报错，不依赖未经验证的 x64 模拟能力，可改在 WSL 中安装对应 Linux Release。WSL 始终按 Linux
-环境识别。
+`windows-x86_64.zip` 并默认安装到 `$HOME/qq-maid-bot`，之后可继续使用 `qbot start/status/log`。
 
 Git Bash 通常已包含所需基础命令；缺少依赖时需通过其安装器补齐 `curl`、`unzip` 和 `coreutils`。
 MSYS2 在 `pacman` 可用时会按缺失命令自动安装对应包。Cygwin 不自动调用安装器，需通过
 `setup-x86_64.exe` 安装上述依赖。
 
 ### 路径三：源码构建（需要 Rust 工具链）
+
+Linux / macOS：
 
 ```bash
 git clone https://github.com/kuliantnt/qq-maid-bot.git
@@ -92,6 +123,22 @@ vim runtime/config/.env
 bash scripts/deploy-local.sh
 runtime/botctl.sh status
 ```
+
+Windows 原生需要 Rust MSVC 工具链及其 C++ 编译环境。在 PowerShell 中执行：
+
+```powershell
+git clone https://github.com/kuliantnt/qq-maid-bot.git
+Set-Location .\qq-maid-bot
+
+Copy-Item .\runtime\config\.env.example .\runtime\config\.env
+notepad .\runtime\config\.env
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+.\runtime\botctl.cmd start
+.\runtime\botctl.cmd status
+```
+
+`install-windows.ps1` 会执行 workspace release 构建，并把 `qq-maid-bot.exe`、Windows 控制脚本和启动示例安装到 `runtime\`。后续更新源码时，先执行 `runtime\botctl.cmd stop`，重新运行安装脚本，再执行 `runtime\botctl.cmd start`；Windows 可能不允许覆盖运行中的 exe。
 
 ### 遇到问题？
 
