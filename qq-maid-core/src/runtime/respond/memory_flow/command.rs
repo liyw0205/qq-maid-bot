@@ -54,10 +54,8 @@ pub(super) fn parse_memory_management_command(text: &str) -> Option<ParsedComman
             }
         }
         "add" | "新增" | "添加" | "记住" => return None,
-        // 保留旧 `/memory group 关键词` 的隐式搜索；新 personal/profile 命名空间
-        // 的自由文本则作为明确分域写入草稿处理。
+        // 兼容旧语义：命名空间后的自由文本是搜索词；只有 add 等显式子命令进入写入。
         _ if namespace == Some(MemoryNamespace::Group) => ("memory_list", rest.to_owned()),
-        _ if namespace.is_some() => return None,
         _ => return None,
     };
     Some(ParsedCommand {

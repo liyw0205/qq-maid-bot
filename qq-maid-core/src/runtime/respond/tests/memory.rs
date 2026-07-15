@@ -20,7 +20,7 @@ fn group_member_message(text: &str, role: Option<&str>) -> RespondRequest {
 }
 
 #[tokio::test]
-async fn memory_create_update_and_delete_require_confirmation() {
+async fn memory_create_is_direct_while_update_and_delete_require_confirmation() {
     let service = test_service();
 
     let created = service
@@ -31,23 +31,7 @@ async fn memory_create_update_and_delete_require_confirmation() {
         .unwrap()
         .text
         .unwrap();
-    assert!(created.contains("已整理记忆草稿"));
-    assert!(
-        service
-            .memory_store
-            .list(ListMemoryQuery::default())
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        service
-            .respond(private_message("确认"))
-            .await
-            .unwrap()
-            .text
-            .unwrap()
-            .contains("已保存个人记忆")
-    );
+    assert!(created.contains("🧠 已记住"));
     let record = service
         .memory_store
         .list(ListMemoryQuery::default())
@@ -125,16 +109,6 @@ async fn personal_memory_write_does_not_require_group_admin_role() {
         .await
         .unwrap();
     assert!(created.text.as_deref().unwrap().contains("个人记忆"));
-    assert!(
-        service
-            .respond(group_member_message("确认", Some("member")))
-            .await
-            .unwrap()
-            .text
-            .unwrap()
-            .contains("已保存个人记忆")
-    );
-
     assert!(
         service
             .memory_store
@@ -273,6 +247,106 @@ async fn group_memory_management_requires_owner_or_admin() {
         .unwrap()
         .unwrap();
     assert!(active.pending_operation.is_none());
+}
+
+#[tokio::test]
+async fn legacy_group_keyword_is_search_and_explicit_add_writes() {
+    let service = test_service();
+    service
+        .memory_store
+        .create_scoped(CreateScopedMemoryRequest {
+            scope_type: MemoryScopeType::Group,
+            scope_id: "g1".to_owned(),
+            created_by_user_id: "u1".to_owned(),
+            user_id: Some("u1".to_owned()),
+            group_id: Some("g1".to_owned()),
+            content: "Rust 项目统一使用 workspace Cargo.lock".to_owned(),
+            source_text: "seed".to_owned(),
+            memory_type: "note".to_owned(),
+            scope: "general".to_owned(),
+        })
+        .unwrap();
+
+    let before = service
+        .memory_store
+        .list_scoped(ScopedMemoryQuery {
+            scope_type: MemoryScopeType::Group,
+            scope_id: "g1".to_owned(),
+            limit: Some(10),
+            q: None,
+            scope: None,
+            memory_type: None,
+        })
+        .unwrap()
+        .len();
+    let searched = service
+        .respond(message("/memory group Rust"))
+        .await
+        .unwrap();
+    assert_eq!(searched.command.as_deref(), Some("memory_list"));
+    assert!(
+        searched
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("Rust 项目统一使用 workspace Cargo.lock")
+    );
+    assert_eq!(
+        service
+            .memory_store
+            .list_scoped(ScopedMemoryQuery {
+                scope_type: MemoryScopeType::Group,
+                scope_id: "g1".to_owned(),
+                limit: Some(10),
+                q: None,
+                scope: None,
+                memory_type: None,
+            })
+            .unwrap()
+            .len(),
+        before,
+        "兼容搜索不得新增群记忆"
+    );
+    let explicit_search = service
+        .respond(message("/memory group list Rust"))
+        .await
+        .unwrap();
+    assert_eq!(explicit_search.command.as_deref(), Some("memory_list"));
+    assert!(
+        explicit_search
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("Rust 项目统一使用 workspace Cargo.lock")
+    );
+
+    let added = service
+        .respond(message("/memory group add Rust"))
+        .await
+        .unwrap();
+    assert_eq!(added.command.as_deref(), Some("memory_saved"));
+    assert!(
+        added
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("范围：当前群公共记忆")
+    );
+    assert_eq!(
+        service
+            .memory_store
+            .list_scoped(ScopedMemoryQuery {
+                scope_type: MemoryScopeType::Group,
+                scope_id: "g1".to_owned(),
+                limit: Some(10),
+                q: None,
+                scope: None,
+                memory_type: None,
+            })
+            .unwrap()
+            .len(),
+        before + 1
+    );
 }
 
 #[tokio::test]
@@ -466,17 +540,10 @@ async fn memory_create_accepts_fenced_json_but_saves_content_only() {
         .unwrap()
         .text
         .unwrap();
-    assert!(created.contains("已整理记忆草稿"));
+    assert!(created.contains("🧠 已记住"));
     assert!(created.contains("技术方案回复时先给结论和风险"));
     assert!(!created.contains("```"));
     assert!(!created.contains("\"content\""));
-    let confirmed = service
-        .respond(message("确认"))
-        .await
-        .unwrap()
-        .text
-        .unwrap();
-    assert!(confirmed.contains("已保存个人记忆"));
     let record = service
         .memory_store
         .list(ListMemoryQuery::default())
@@ -497,7 +564,7 @@ async fn memory_root_aliases_list_records_without_llm() {
     for command in ["/memory", "/记忆", "/记"] {
         let response = service.respond(private_message(command)).await.unwrap();
         assert_eq!(response.command.as_deref(), Some("memory_list"));
-        assert_eq!(response.text.unwrap(), "当前没有个人长期记忆。");
+        assert!(response.text.unwrap().contains("当前还没有内容"));
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
@@ -520,9 +587,9 @@ async fn memory_root_aliases_list_records_without_llm() {
         .text
         .unwrap();
     let populated = service.respond(private_message("/记忆")).await.unwrap();
-    assert!(text.contains("长期记忆："));
+    assert!(text.contains("🧠 个人记忆（共 1 条）"));
     assert!(text.contains("日常聊天中不要只用编号称呼成员"));
-    assert!(text.contains("操作：/memory show 1"));
+    assert!(text.contains("/memory show 1"));
     assert!(populated.markdown.as_deref().unwrap().contains("1. "));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
@@ -567,7 +634,7 @@ async fn memory_management_uses_recent_list_index() {
         .await
         .unwrap();
     assert!(detail.text.as_deref().unwrap().contains("第二条记忆"));
-    assert!(detail.markdown.as_deref().unwrap().contains("- 内容："));
+    assert!(detail.markdown.as_deref().unwrap().contains("内容："));
 
     let edit = service
         .respond(private_message("/memory edit 1 第二条记忆已更新"))
