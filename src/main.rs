@@ -7,8 +7,13 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use qq_maid_core::{
-    app::LlmRuntime as CoreRuntime, config::AppConfig as CoreConfig,
+    app::LlmRuntime as CoreRuntime,
+    config::{
+        AppConfig as CoreConfig, center::ConfigCenter, center::ConfigCenterPaths,
+        database_bootstrap_from_environment, install_resolved_environment,
+    },
     storage::identity_rebaseline::rebaseline_qq_official_identity,
+    storage::{APP_MIGRATIONS, database::SqliteDatabase},
 };
 use qq_maid_gateway_rs::{
     config::AppConfig as GatewayConfig,
@@ -30,9 +35,26 @@ async fn main() -> anyhow::Result<()> {
     qq_maid_core::app::load_dotenv_files();
     init_tracing()?;
 
+    let external_environment = std::env::vars().collect::<HashMap<_, _>>();
+    let (database_file, database_pool_size) =
+        database_bootstrap_from_environment(&external_environment)?;
+    let database =
+        SqliteDatabase::open_with_pool_size(&database_file, APP_MIGRATIONS, database_pool_size)?;
+    let mut managed_fields = qq_maid_core::config::managed_config_fields();
+    managed_fields.extend(qq_maid_gateway_rs::config::managed_config_fields());
+    let config_center = ConfigCenter::open(
+        managed_fields,
+        ConfigCenterPaths::from_environment(&external_environment),
+        database.clone(),
+    )?
+    .with_external_environment(external_environment.clone());
+    let resolved_environment = config_center.resolved_environment(&external_environment)?;
+    install_resolved_environment(resolved_environment.clone())?;
     let core_config = CoreConfig::from_env()?;
-    let gateway_env = std::env::vars().collect::<HashMap<_, _>>();
-    let gateway_config = GatewayConfig::from_map(&gateway_env)?;
+    let config_center = config_center
+        .with_running_agent_config(core_config.agent_config.clone())?
+        .with_startup_preflight(preflight_candidate_startup);
+    let gateway_config = GatewayConfig::from_map(&resolved_environment)?;
     if let Some(app_id) = gateway_config.app_id.as_deref() {
         let rebaseline_report = rebaseline_qq_official_identity(&core_config.app_db_file, app_id)?;
         if rebaseline_report.changed() {
@@ -54,8 +76,10 @@ async fn main() -> anyhow::Result<()> {
         gateway_config.clone(),
         gateway_runtime.clone(),
     ));
-    let core_runtime = CoreRuntime::from_config_with_push_sink_and_console_source(
+    let core_runtime = CoreRuntime::from_config_with_database_push_sink_and_console_source(
         core_config,
+        database,
+        Some(config_center),
         Some(Arc::new(push_sink.clone())),
         console_status_source,
         env!("CARGO_PKG_VERSION"),
@@ -112,6 +136,19 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// 根程序同时依赖 Core、LLM 与 Gateway；在这里组合真实启动预检可保持依赖方向，
+/// 同时避免配置中心复制跨字段和 Provider 路由规则。错误不拼接候选值，防止 secret 泄漏。
+fn preflight_candidate_startup(
+    environment: &HashMap<String, String>,
+    candidate_agent: Option<&qq_maid_core::config::AgentRuntimeConfig>,
+) -> Result<(), String> {
+    CoreConfig::preflight_environment(environment, candidate_agent)
+        .map_err(|_| "candidate Core/LLM configuration is invalid".to_owned())?;
+    GatewayConfig::from_map(environment)
+        .map(|_| ())
+        .map_err(|_| "candidate Gateway configuration is invalid".to_owned())
+}
+
 fn task_exit_error(
     task_name: &str,
     result: Result<anyhow::Result<()>, tokio::task::JoinError>,
@@ -142,4 +179,340 @@ fn shanghai_log_timer() -> impl tracing_subscriber::fmt::time::FormatTime {
         UtcOffset::from_hms(8, 0, 0).expect("valid Asia/Shanghai UTC offset"),
         format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qq_maid_core::config::center::{
+        ManagedConfigChange, SECRET_MISSING_REVISION, SecretConfigChange,
+    };
+    use std::path::{Path, PathBuf};
+    use toml::Value;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "qq-maid-root-config-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_config_center(
+        name: &str,
+        additional_external: &[(&str, &str)],
+    ) -> (ConfigCenter, SqliteDatabase, TestDirectory) {
+        let directory = TestDirectory::new(name);
+        let database =
+            SqliteDatabase::open_with_pool_size(directory.path().join("app.db"), APP_MIGRATIONS, 1)
+                .unwrap();
+        let mut fields = qq_maid_core::config::managed_config_fields();
+        fields.extend(qq_maid_gateway_rs::config::managed_config_fields());
+        let mut external = HashMap::from([
+            (
+                "AGENT_CONFIG_FILE".to_owned(),
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("runtime/config/agent.toml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ("OPENAI_API_KEY".to_owned(), "test-provider-key".to_owned()),
+        ]);
+        external.extend(
+            additional_external
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+        );
+        let center = ConfigCenter::open(
+            fields,
+            ConfigCenterPaths {
+                managed_config_file: directory.path().join("runtime.toml"),
+                master_key_file: directory.path().join("secrets/master.key"),
+            },
+            database.clone(),
+        )
+        .unwrap()
+        .with_external_environment(external)
+        .with_startup_preflight(preflight_candidate_startup);
+        (center, database, directory)
+    }
+
+    fn provider_config_center(
+        name: &str,
+    ) -> (ConfigCenter, SqliteDatabase, TestDirectory, PathBuf) {
+        let directory = TestDirectory::new(name);
+        let database =
+            SqliteDatabase::open_with_pool_size(directory.path().join("app.db"), APP_MIGRATIONS, 1)
+                .unwrap();
+        let agent_path = directory.path().join("config/agent.toml");
+        std::fs::create_dir_all(agent_path.parent().unwrap()).unwrap();
+        std::fs::write(&agent_path, include_str!("../runtime/config/agent.toml")).unwrap();
+        let external = HashMap::from([(
+            "AGENT_CONFIG_FILE".to_owned(),
+            agent_path.to_string_lossy().into_owned(),
+        )]);
+        let running_agent =
+            qq_maid_core::config::AgentRuntimeConfig::load_from_environment(&external).unwrap();
+        let mut fields = qq_maid_core::config::managed_config_fields();
+        fields.extend(qq_maid_gateway_rs::config::managed_config_fields());
+        let center = ConfigCenter::open(
+            fields,
+            ConfigCenterPaths {
+                managed_config_file: directory.path().join("runtime.toml"),
+                master_key_file: directory.path().join("secrets/master.key"),
+            },
+            database.clone(),
+        )
+        .unwrap()
+        .with_external_environment(external)
+        .with_running_agent_config(running_agent)
+        .unwrap();
+        (center, database, directory, agent_path)
+    }
+
+    #[test]
+    fn core_and_gateway_managed_fields_form_one_valid_registry() {
+        let mut fields = qq_maid_core::config::managed_config_fields();
+        fields.extend(qq_maid_gateway_rs::config::managed_config_fields());
+        qq_maid_core::config::center::ConfigRegistry::new(fields).unwrap();
+    }
+
+    #[test]
+    fn clearing_last_provider_key_is_rejected_and_secret_is_unchanged() {
+        let (center, _database, _directory, _agent_path) =
+            provider_config_center("provider-last-key");
+        let original_revision = center
+            .replace_secret(
+                "provider.openai.api_key",
+                "original-openai-key",
+                SECRET_MISSING_REVISION,
+            )
+            .unwrap();
+        let center = center.with_startup_preflight(preflight_candidate_startup);
+
+        let error = center
+            .clear_secret("provider.openai.api_key", &original_revision)
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_config");
+        let snapshot = center.current_snapshot().unwrap();
+        let secret = snapshot
+            .fields
+            .iter()
+            .find(|field| field.key == "provider.openai.api_key")
+            .unwrap();
+        assert!(secret.configured);
+        assert_eq!(secret.revision.as_deref(), Some(original_revision.as_str()));
+    }
+
+    #[test]
+    fn clearing_one_provider_key_succeeds_when_every_route_has_another_provider() {
+        let (center, _database, _directory, _agent_path) =
+            provider_config_center("provider-fallback-key");
+        let openai_revision = center
+            .replace_secret(
+                "provider.openai.api_key",
+                "openai-key",
+                SECRET_MISSING_REVISION,
+            )
+            .unwrap();
+        center
+            .replace_secret(
+                "provider.deepseek.api_key",
+                "deepseek-key",
+                SECRET_MISSING_REVISION,
+            )
+            .unwrap();
+        let center = center.with_startup_preflight(preflight_candidate_startup);
+
+        let revision = center
+            .clear_secret("provider.openai.api_key", &openai_revision)
+            .unwrap();
+        assert_eq!(revision, SECRET_MISSING_REVISION);
+        let environment = center.resolved_environment(&HashMap::new()).unwrap();
+        assert!(!environment.contains_key("OPENAI_API_KEY"));
+        assert!(environment.contains_key("DEEPSEEK_API_KEY"));
+    }
+
+    #[test]
+    fn undeclared_custom_provider_route_is_rejected_before_agent_replace() {
+        let (center, _database, _directory, agent_path) =
+            provider_config_center("agent-undeclared-provider");
+        center
+            .replace_secret(
+                "provider.openai.api_key",
+                "openai-key",
+                SECRET_MISSING_REVISION,
+            )
+            .unwrap();
+        let center = center.with_startup_preflight(preflight_candidate_startup);
+        let initial = center.current_snapshot().unwrap().agent.unwrap();
+        let before = std::fs::read(&agent_path).unwrap();
+
+        let error = center
+            .update_agent(
+                &initial.revision,
+                &[
+                    qq_maid_core::config::center::AgentConfigChange::SetModelRoute {
+                        name: "private_main".to_owned(),
+                        candidates: vec!["custom_provider:model".to_owned()],
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_config");
+        assert_eq!(std::fs::read(agent_path).unwrap(), before);
+    }
+
+    #[test]
+    fn declared_custom_provider_route_with_key_saves_successfully() {
+        let (center, _database, _directory, agent_path) =
+            provider_config_center("agent-declared-provider");
+        center
+            .replace_secret(
+                "provider.openai.api_key",
+                "openai-key",
+                SECRET_MISSING_REVISION,
+            )
+            .unwrap();
+        center
+            .replace_secret("provider.mimo.api_key", "mimo-key", SECRET_MISSING_REVISION)
+            .unwrap();
+        let center = center.with_startup_preflight(preflight_candidate_startup);
+        let initial = center.current_snapshot().unwrap().agent.unwrap();
+
+        center
+            .update_agent(
+                &initial.revision,
+                &[
+                    qq_maid_core::config::center::AgentConfigChange::SetModelRoute {
+                        name: "private_main".to_owned(),
+                        candidates: vec!["mimo:mimo-v2.5".to_owned()],
+                    },
+                ],
+            )
+            .unwrap();
+        let text = std::fs::read_to_string(agent_path).unwrap();
+        assert!(text.contains("candidates = [\"mimo:mimo-v2.5\"]"));
+    }
+
+    #[test]
+    fn onebot_requires_token_but_accepts_external_override() {
+        let (center, _database, _directory) = test_config_center("onebot-invalid", &[]);
+        let error = center
+            .update_managed(
+                SECRET_MISSING_REVISION,
+                &[ManagedConfigChange::Set {
+                    key: "platform.onebot11.enabled".to_owned(),
+                    value: Value::Boolean(true),
+                }],
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_config");
+        assert_eq!(center.current_snapshot().unwrap().revision, "missing");
+
+        let (center, _database, _directory) = test_config_center(
+            "onebot-external",
+            &[("ONEBOT11_ACCESS_TOKEN", "external-token")],
+        );
+        center
+            .update_managed(
+                SECRET_MISSING_REVISION,
+                &[ManagedConfigChange::Set {
+                    key: "platform.onebot11.enabled".to_owned(),
+                    value: Value::Boolean(true),
+                }],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn wechat_aes_uses_gateway_completeness_and_key_validation() {
+        let (center, _database, _directory) = test_config_center(
+            "wechat-aes-missing",
+            &[("WECHAT_SERVICE_TOKEN", "external-token")],
+        );
+        let error = center
+            .update_managed(
+                SECRET_MISSING_REVISION,
+                &[
+                    ManagedConfigChange::Set {
+                        key: "platform.wechat_service.enabled".to_owned(),
+                        value: Value::Boolean(true),
+                    },
+                    ManagedConfigChange::Set {
+                        key: "platform.wechat_service.encryption_mode".to_owned(),
+                        value: Value::String("aes".to_owned()),
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_config");
+        assert_eq!(center.current_snapshot().unwrap().revision, "missing");
+
+        let error = center
+            .replace_secret(
+                "platform.wechat_service.encoding_aes_key",
+                "invalid-key-must-not-appear-in-error",
+                SECRET_MISSING_REVISION,
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_config");
+        assert!(
+            !error
+                .message()
+                .contains("invalid-key-must-not-appear-in-error")
+        );
+    }
+
+    #[test]
+    fn qq_credentials_require_atomic_batch_and_snapshot_stays_redacted() {
+        let (center, _database, _directory) = test_config_center("qq-batch", &[]);
+        let error = center
+            .replace_secret(
+                "platform.qq_official.app_id",
+                "qq-app-id-plaintext",
+                SECRET_MISSING_REVISION,
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_config");
+
+        center
+            .update_secrets(&[
+                SecretConfigChange::Replace {
+                    key: "platform.qq_official.app_id".to_owned(),
+                    value: "qq-app-id-plaintext".to_owned(),
+                    expected_revision: SECRET_MISSING_REVISION.to_owned(),
+                },
+                SecretConfigChange::Replace {
+                    key: "platform.qq_official.app_secret".to_owned(),
+                    value: "qq-app-secret-plaintext".to_owned(),
+                    expected_revision: SECRET_MISSING_REVISION.to_owned(),
+                },
+            ])
+            .unwrap();
+        let snapshot = center.current_snapshot().unwrap();
+        assert!(snapshot.fields.iter().all(|field| field.valid));
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("qq-app-id-plaintext"));
+        assert!(!json.contains("qq-app-secret-plaintext"));
+    }
 }

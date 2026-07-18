@@ -1,0 +1,12 @@
+# qq-maid 程序受管运行配置示例。
+#
+# 实际文件默认为 config/runtime.toml，由 WebUI 与高级用户共同编辑。模型路线、Profile、
+# Scene、Tool Calling 和 Tool 白名单只写入 agent.toml，不得在本文件保留第二份值。
+# API Key、Token、AppSecret 等敏感值严禁写入本文件，它们由配置中心认证加密后存入 SQLite。
+
+version = 1
+
+[values]
+# "features.rss.enabled" = true
+# "features.todo.daily_reminder_time" = "09:00"
+# "platform.onebot11.enabled" = false
