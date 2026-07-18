@@ -3,9 +3,9 @@ use std::{env, fs, process::ExitCode};
 use qq_maid_core::runtime::tools::knowledge::eval::{parse_dataset, run_fts5_baseline};
 
 fn main() -> ExitCode {
-    let dataset_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "qq-maid-core/tests/fixtures/knowledge_eval_v1.json".to_owned());
+    let dataset_path = env::args().nth(1).unwrap_or_else(|| {
+        "qq-maid-core/src/runtime/tools/knowledge/fixtures/knowledge_eval_v1.json".to_owned()
+    });
     let result = fs::read_to_string(&dataset_path)
         .map_err(|error| format!("failed to read {dataset_path}: {error}"))
         .and_then(|json| parse_dataset(&json))
