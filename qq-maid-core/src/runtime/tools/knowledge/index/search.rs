@@ -133,15 +133,23 @@ fn expand_with_adjacent_chunks(
 ) -> Result<Vec<KnowledgeSearchResult>, crate::storage::database::DatabaseError> {
     // 保持 lexical 主命中在所有 adjacent 补充片段之前；Tool 层按 max_results
     // 裁剪时即可优先保留真正命中的证据，而不会被 chunk_index 较小的邻接片段挤掉。
+    // 先完整登记所有 lexical chunk，避免前一个命中的邻接查询提前占用后一个
+    // lexical chunk 的 ID，导致真正的主命中被错误标记为 adjacent。
+    let mut lexical_chunk_ids = HashSet::<String>::new();
     let mut lexical = Vec::new();
-    let mut adjacent = Vec::new();
-    let mut seen_chunk_ids = HashSet::<String>::new();
     for result in selected {
-        if seen_chunk_ids.insert(result.chunk_id.clone()) {
-            lexical.push(result.clone());
+        if lexical_chunk_ids.insert(result.chunk_id.clone()) {
+            lexical.push(result);
         }
+    }
+
+    let mut adjacent = Vec::new();
+    let mut seen_adjacent_chunk_ids = HashSet::<String>::new();
+    for result in &lexical {
         for item in store.adjacent_chunks(result.document_id, result.chunk_index)? {
-            if seen_chunk_ids.insert(item.chunk_id.clone()) {
+            if !lexical_chunk_ids.contains(&item.chunk_id)
+                && seen_adjacent_chunk_ids.insert(item.chunk_id.clone())
+            {
                 adjacent.push(item);
             }
         }

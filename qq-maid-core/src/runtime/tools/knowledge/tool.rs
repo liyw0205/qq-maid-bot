@@ -412,6 +412,40 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn adjacent_lexical_hits_remain_lexical_and_survive_max_results() {
+        let content = "# 相邻主命中回归\n\n\
+## 普通前置片段\n\n这是 lexical 主命中前的普通相邻内容，不包含检索目标。\n\n\
+## 第一主命中\n\nLEXICAL-PAIR-TARGET 出现在第一个主命中片段。\n\n\
+## 第二主命中\n\nLEXICAL-PAIR-TARGET 出现在第二个主命中片段。";
+        let tool = tool_with_content(content, 4_000);
+
+        let evidence = tool.index.search_evidence("LEXICAL-PAIR-TARGET");
+        let lexical = evidence
+            .items
+            .iter()
+            .filter(|item| item.recall_type == super::super::KnowledgeRecallType::Lexical)
+            .collect::<Vec<_>>();
+        assert_eq!(lexical.len(), 2);
+        assert!(lexical.iter().all(|item| item.score.is_some()));
+        assert!(evidence.items.iter().any(|item| {
+            item.recall_type == super::super::KnowledgeRecallType::Adjacent
+                && item.body_excerpt.contains("普通相邻内容")
+        }));
+
+        let output = tool
+            .execute(
+                context(),
+                json!({"query": "LEXICAL-PAIR-TARGET", "max_results": 2}),
+            )
+            .await
+            .unwrap();
+        let items = output.value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| item["recall_type"] == "lexical"));
+        assert!(items.iter().all(|item| item["score"].is_number()));
+    }
+
     fn evidence_for_compaction(status: KnowledgeEvidenceStatus) -> KnowledgeEvidence {
         let long_body = "正文证据。".repeat(700);
         KnowledgeEvidence {
