@@ -33,6 +33,68 @@ fi
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
+
+agent_template="${tmp_dir}/agent-template.toml"
+printf '%s\n' 'version = 1' '[scenes.private]' 'enabled_tools = ["new_tool"]' > "${agent_template}"
+
+agent_yes="${tmp_dir}/agent-yes.toml"
+printf '%s\n' 'version = 1' 'custom = "keep-before-replacement"' > "${agent_yes}"
+output="$(prompt_agent_config_replacement "${agent_yes}" "${agent_template}" y)"
+cmp -s "${agent_yes}" "${agent_template}"
+grep -Fqx 'custom = "keep-before-replacement"' "${agent_yes}.old"
+[[ "${output}" == *"旧配置备份: ${agent_yes}.old"* ]]
+[[ "${output}" == *"Provider、模型路线、Scene 和工具白名单"* ]]
+
+for response in n ""; do
+    agent_keep="${tmp_dir}/agent-keep-${response:-empty}.toml"
+    printf '%s\n' 'version = 1' "custom = \"keep-${response:-empty}\"" > "${agent_keep}"
+    original_hash="$(sha256sum "${agent_keep}")"
+    output="$(prompt_agent_config_replacement "${agent_keep}" "${agent_template}" "${response}")"
+    [[ "$(sha256sum "${agent_keep}")" == "${original_hash}" ]]
+    [[ ! -e "${agent_keep}.old" ]]
+    [[ "${output}" == *"已保留现有 agent.toml"* ]]
+done
+
+agent_collision="${tmp_dir}/agent-collision.toml"
+printf '%s\n' 'current-old-config' > "${agent_collision}"
+printf '%s\n' 'earlier-backup' > "${agent_collision}.old"
+prompt_agent_config_replacement "${agent_collision}" "${agent_template}" y >/dev/null
+grep -Fqx 'earlier-backup' "${agent_collision}.old"
+grep -Fqx 'current-old-config' "${agent_collision}.old.1"
+cmp -s "${agent_collision}" "${agent_template}"
+
+agent_failure="${tmp_dir}/agent-failure.toml"
+printf '%s\n' 'original-must-survive' > "${agent_failure}"
+mv_calls=0
+# shellcheck disable=SC2317 # 测试通过同名函数模拟第二次 mv 失败。
+mv() {
+    mv_calls=$((mv_calls + 1))
+    if ((mv_calls == 2)); then
+        return 1
+    fi
+    command mv "$@"
+}
+set +e
+failure_output="$(replace_agent_config_from_release "${agent_failure}" "${agent_template}" 2>&1)"
+failure_status=$?
+set -e
+unset -f mv
+[[ "${failure_status}" -ne 0 ]]
+grep -Fqx 'original-must-survive' "${agent_failure}"
+[[ ! -e "${agent_failure}.old" ]]
+if compgen -G "${tmp_dir}/.agent.toml.new.*" >/dev/null; then
+    echo "agent replacement left a temporary file" >&2
+    exit 1
+fi
+[[ "${failure_output}" == *"已恢复原文件"* ]]
+
+agent_noninteractive="${tmp_dir}/agent-noninteractive.toml"
+printf '%s\n' 'noninteractive-must-stay' > "${agent_noninteractive}"
+output="$(prompt_agent_config_replacement "${agent_noninteractive}" "${agent_template}" < /dev/null)"
+grep -Fqx 'noninteractive-must-stay' "${agent_noninteractive}"
+[[ ! -e "${agent_noninteractive}.old" ]]
+[[ "${output}" == *"非交互环境，默认保留"* ]]
+
 fixture="${tmp_dir}/fixture"
 output="${tmp_dir}/output"
 package="qq-maid-bot-v9.9.9-linux-x86_64"

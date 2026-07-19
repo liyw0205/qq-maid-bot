@@ -645,6 +645,109 @@ migrate_obsolete_env_config() {
     echo "如 systemd、Docker 或宿主环境仍注入同名变量，请同步人工移除。"
 }
 
+next_agent_config_backup() {
+    local file="$1"
+    local candidate="${file}.old"
+    local suffix=0
+
+    while [[ -e "${candidate}" || -L "${candidate}" ]]; do
+        suffix=$((suffix + 1))
+        candidate="${file}.old.${suffix}"
+    done
+    echo "${candidate}"
+}
+
+replace_agent_config_from_release() {
+    local file="$1"
+    local template="$2"
+    local dir tmp backup owner group mode
+
+    [[ -f "${file}" ]] || {
+        ui_fail "Agent 配置替换失败：现有文件不存在: ${file}"
+        return 1
+    }
+    [[ ! -L "${file}" ]] || {
+        ui_fail "Agent 配置替换失败：不自动替换符号链接: ${file}"
+        return 1
+    }
+    [[ -f "${template}" ]] || {
+        ui_fail "Agent 配置替换失败：Release 模板不存在: ${template}"
+        return 1
+    }
+
+    dir="$(dirname -- "${file}")"
+    if ! tmp="$(mktemp "${dir}/.agent.toml.new.XXXXXX")"; then
+        ui_fail "Agent 配置替换失败：无法在 ${dir} 创建临时文件"
+        return 1
+    fi
+    if ! cp -- "${template}" "${tmp}" || ! cmp -s -- "${template}" "${tmp}"; then
+        rm -f -- "${tmp}"
+        ui_fail "Agent 配置替换失败：无法完整写入新版模板；原文件未修改"
+        return 1
+    fi
+
+    owner="$(stat -c '%u' "${file}" 2>/dev/null || true)"
+    group="$(stat -c '%g' "${file}" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "${file}" 2>/dev/null || true)"
+    if [[ -n "${owner}" && -n "${group}" ]]; then
+        chown "${owner}:${group}" "${tmp}" 2>/dev/null || true
+    fi
+    if [[ -n "${mode}" ]]; then
+        chmod "${mode}" "${tmp}" 2>/dev/null || true
+    fi
+
+    backup="$(next_agent_config_backup "${file}")"
+    if ! mv -- "${file}" "${backup}"; then
+        rm -f -- "${tmp}"
+        ui_fail "Agent 配置替换失败：无法备份原文件；原文件未修改"
+        return 1
+    fi
+    if ! mv -- "${tmp}" "${file}"; then
+        rm -f -- "${tmp}"
+        if [[ ! -e "${file}" && ! -L "${file}" ]] && mv -- "${backup}" "${file}"; then
+            ui_fail "Agent 配置替换失败：新版模板未生效，已恢复原文件"
+        else
+            ui_fail "Agent 配置替换失败且无法自动恢复；原文件保留在: ${backup}"
+        fi
+        return 1
+    fi
+
+    echo "已使用当前 Release 的新版默认配置替换 agent.toml"
+    echo "旧配置备份: ${backup}"
+    echo "请参考备份重新填写 Provider、模型路线、Scene 和工具白名单等自定义配置。"
+}
+
+prompt_agent_config_replacement() {
+    local file="$1"
+    local template="$2"
+    local reply=""
+    local reply_provided=0
+
+    [[ -f "${file}" || -L "${file}" ]] || return 0
+    echo "检测到现有 agent.toml，当前版本的配置结构可能已更新。"
+
+    # 第三个参数只供脚本回归测试注入回答；真实更新必须来自交互终端。
+    if (($# >= 3)); then
+        reply="${3}"
+        reply_provided=1
+    elif [[ -t 0 ]]; then
+        read -r -p "是否使用新版默认配置替换？原文件将备份为 agent.toml.old。[y/N] " reply || reply=""
+        reply_provided=1
+    fi
+
+    if ((reply_provided == 0)); then
+        echo "当前为非交互环境，默认保留现有 agent.toml。"
+        echo "旧配置可能不兼容；请手工检查，或在交互终端重新运行 qbot update。"
+        return 0
+    fi
+    if [[ "${reply}" != "y" && "${reply}" != "Y" ]]; then
+        echo "已保留现有 agent.toml；旧配置可能不兼容，请自行检查。"
+        return 0
+    fi
+
+    replace_agent_config_from_release "${file}" "${template}"
+}
+
 get_env_var() {
     local key="$1"
     local file
@@ -1895,16 +1998,22 @@ install_or_update() {
     version="$(resolve_version "${requested_version}")"
     current="$(local_version 2>/dev/null || true)"
 
-    if [[ "${command_name}" == "update" && -n "${current}" && "$(normalize_version "${current}")" == "${version}" ]]; then
-        migrate_obsolete_env_config
-        echo "当前已是目标版本: ${current}"
-        return 0
-    fi
-
     tmp_dir="$(mktemp -d)"
     TMP_DIR_TO_CLEAN="${tmp_dir}"
 
     release_dir="$(download_release "${version}" "${target}" "${tmp_dir}")"
+
+    prompt_agent_config_replacement \
+        "${APP_DIR}/config/agent.toml" \
+        "${release_dir}/config/agent.toml" || die "替换 agent.toml 失败，已停止本次更新"
+
+    if [[ "${command_name}" == "update" && -n "${current}" && "$(normalize_version "${current}")" == "${version}" ]]; then
+        migrate_obsolete_env_config
+        rm -rf "${tmp_dir}"
+        TMP_DIR_TO_CLEAN=""
+        echo "当前已是目标版本: ${current}"
+        return 0
+    fi
 
     was_running=0
     if is_qbot_running; then

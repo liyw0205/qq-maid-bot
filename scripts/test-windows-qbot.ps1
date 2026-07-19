@@ -53,6 +53,67 @@ try {
     Set-Content -LiteralPath (Join-Path $releaseDir "config\.env.example") -Value "EXAMPLE=1" -Encoding ASCII
     Set-Content -LiteralPath (Join-Path $releaseDir "config\agent.toml") -Value "release-agent" -Encoding ASCII
 
+    $agentTestDir = Join-Path $testRoot "agent-migration"
+    New-Item -ItemType Directory -Path $agentTestDir -Force | Out-Null
+    $agentTemplate = Join-Path $agentTestDir "template.toml"
+    Set-Content -LiteralPath $agentTemplate -Value "new-release-template" -Encoding ASCII
+
+    $agentYes = Join-Path $agentTestDir "yes.toml"
+    Set-Content -LiteralPath $agentYes -Value "custom-before-replacement" -Encoding ASCII
+    $yesOutput = (Request-AgentConfigReplacement -ConfigFile $agentYes -TemplateFile $agentTemplate -Response "y") -join "`n"
+    Assert-True ((Get-FileHash $agentYes).Hash -eq (Get-FileHash $agentTemplate).Hash) "y did not install the Release agent template"
+    Assert-True ((Get-Content -LiteralPath "${agentYes}.old" -Raw).Contains("custom-before-replacement")) "y did not preserve the old agent config"
+    Assert-True ($yesOutput.Contains("旧配置备份: ${agentYes}.old")) "y did not report the agent backup path"
+    Assert-True ($yesOutput.Contains("Provider、模型路线、Scene 和工具白名单")) "y did not report required custom configuration work"
+
+    foreach ($case in @(@{ Name = "no"; Response = "n" }, @{ Name = "empty"; Response = "" })) {
+        $agentKeep = Join-Path $agentTestDir ("keep-" + $case.Name + ".toml")
+        Set-Content -LiteralPath $agentKeep -Value ("keep-" + $case.Name) -Encoding ASCII
+        $beforeHash = (Get-FileHash -LiteralPath $agentKeep -Algorithm SHA256).Hash
+        $keepOutput = (Request-AgentConfigReplacement -ConfigFile $agentKeep -TemplateFile $agentTemplate -Response $case.Response) -join "`n"
+        Assert-True ((Get-FileHash -LiteralPath $agentKeep -Algorithm SHA256).Hash -eq $beforeHash) "$($case.Name) changed agent.toml"
+        Assert-True (-not (Test-Path -LiteralPath "${agentKeep}.old")) "$($case.Name) created an unexpected backup"
+        Assert-True ($keepOutput.Contains("已保留现有 agent.toml")) "$($case.Name) did not report that agent.toml was preserved"
+    }
+
+    $agentCollision = Join-Path $agentTestDir "collision.toml"
+    Set-Content -LiteralPath $agentCollision -Value "current-old-config" -Encoding ASCII
+    Set-Content -LiteralPath "${agentCollision}.old" -Value "earlier-backup" -Encoding ASCII
+    Request-AgentConfigReplacement -ConfigFile $agentCollision -TemplateFile $agentTemplate -Response "Y" | Out-Null
+    Assert-True ((Get-Content -LiteralPath "${agentCollision}.old" -Raw).Contains("earlier-backup")) "existing .old backup was overwritten"
+    Assert-True ((Get-Content -LiteralPath "${agentCollision}.old.1" -Raw).Contains("current-old-config")) "replacement did not use the next backup suffix"
+
+    $agentFailure = Join-Path $agentTestDir "failure.toml"
+    Set-Content -LiteralPath $agentFailure -Value "original-must-survive" -Encoding ASCII
+    $script:AgentMoveCalls = 0
+    function Move-Item {
+        param([string]$LiteralPath, [string]$Destination)
+        $script:AgentMoveCalls++
+        if ($script:AgentMoveCalls -eq 2) {
+            throw "simulated template activation failure"
+        }
+        Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination
+    }
+    $replacementError = $null
+    try {
+        Replace-AgentConfigFromRelease -ConfigFile $agentFailure -TemplateFile $agentTemplate
+    } catch {
+        $replacementError = $_.Exception.Message
+    } finally {
+        Remove-Item Function:\Move-Item -ErrorAction SilentlyContinue
+    }
+    Assert-True ($null -ne $replacementError -and $replacementError.Contains("original file was restored")) "replacement failure was not reported with rollback"
+    Assert-True ((Get-Content -LiteralPath $agentFailure -Raw).Contains("original-must-survive")) "replacement failure did not restore agent.toml"
+    Assert-True (-not (Test-Path -LiteralPath "${agentFailure}.old")) "replacement failure left a misleading backup"
+    Assert-True (@(Get-ChildItem -LiteralPath $agentTestDir -Filter ".agent.toml.new.*").Count -eq 0) "replacement failure left a temporary file"
+
+    $agentNonInteractive = Join-Path $agentTestDir "noninteractive.toml"
+    Set-Content -LiteralPath $agentNonInteractive -Value "noninteractive-must-stay" -Encoding ASCII
+    $nonInteractiveOutput = (Request-AgentConfigReplacement -ConfigFile $agentNonInteractive -TemplateFile $agentTemplate -NonInteractive) -join "`n"
+    Assert-True ((Get-Content -LiteralPath $agentNonInteractive -Raw).Contains("noninteractive-must-stay")) "non-interactive update replaced agent.toml"
+    Assert-True (-not (Test-Path -LiteralPath "${agentNonInteractive}.old")) "non-interactive update created an unexpected backup"
+    Assert-True ($nonInteractiveOutput.Contains("非交互环境，默认保留")) "non-interactive update did not explain the default"
+
     New-Item -ItemType Directory -Path (Join-Path $appDir "config") -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $appDir "data\storage") -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $appDir "logs") -Force | Out-Null
