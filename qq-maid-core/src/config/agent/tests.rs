@@ -5,6 +5,9 @@ fn toml_config_overrides_routes_profiles_and_scenes() {
     let text = r#"
 version = 1
 
+[knowledge]
+mode = "auto"
+
 [model_routes.main]
 candidates = ["openai:gpt-main", "deepseek:deepseek-chat"]
 
@@ -60,11 +63,13 @@ enabled_tools = ["get_weather", "list_todos", "get_weather"]
     let private = config.resolve(ChatScene::Private).unwrap();
     let group = config.resolve(ChatScene::Group).unwrap();
     assert_eq!(private.profile, "deep");
+    assert_eq!(private.knowledge_mode, KnowledgeRetrievalMode::Auto);
     assert_eq!(private.main_model, "openai:gpt-main,deepseek:deepseek-chat");
     assert_eq!(private.reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(private.max_tool_rounds, 8);
     assert_eq!(private.max_output_tokens, Some(3200));
     assert_eq!(group.profile, "fast");
+    assert_eq!(group.knowledge_mode, KnowledgeRetrievalMode::Auto);
     assert_eq!(group.main_model, "openai:gpt-fast");
     assert!(!group.group_tool_calling_enabled);
     assert_eq!(group.enabled_tools, vec!["get_weather", "list_todos"]);
@@ -326,6 +331,7 @@ fn default_agent_toml_preserves_private_and_group_scene_routes() {
             "get_rss_recent_items",
             "manage_rss_subscriptions",
             "web_search",
+            "knowledge_search",
             "save_memory"
         ]
     );

@@ -10,7 +10,7 @@ use qq_maid_llm::agent_loop::{AgentRunHandle, AgentTextDeltaSink, ToolLoopProgre
 use serde_json::{Value, json};
 
 use crate::{
-    config::agent::AgentConfigSource,
+    config::agent::{AgentConfigSource, KnowledgeRetrievalMode},
     error::LlmError,
     runtime::{
         session::{SessionMeta, SessionRecord, SessionTurnActor, is_shared_conversation_scope},
@@ -119,8 +119,6 @@ impl RustRespondService {
 
         let session_context = build_session_context(&session);
 
-        let knowledge_context = self.knowledge_index.search_context(&user_text)?;
-        let used_knowledge = !knowledge_context.text.trim().is_empty();
         let memory_context = self.build_memory_context(&meta, &user_text)?;
         let used_memory = !memory_context.trim().is_empty();
         let is_shared_conversation = is_shared_conversation_scope(&meta.scope);
@@ -136,6 +134,9 @@ impl RustRespondService {
             system_prompts
         };
         let policy = self.resolve_agent_policy(&req)?;
+        let (knowledge_context, knowledge_hit_count) =
+            self.automatic_knowledge_context(policy.knowledge_mode, &user_text)?;
+        let used_knowledge = knowledge_hit_count > 0;
         let dream_context =
             self.memory_dream_context(&req, &meta, policy.resolve_auxiliary_model(None));
         // 群聊 Tool Loop 的用户私有交互状态必须与公开 conversation session 隔离。
@@ -151,7 +152,7 @@ impl RustRespondService {
             message_context: req.message_context.clone(),
             system_prompts,
             memory_context,
-            knowledge_context: knowledge_context.text.clone(),
+            knowledge_context: knowledge_context.clone(),
             session_context,
             history_messages: recent_session_messages(&session, SESSION_HISTORY_MESSAGE_LIMIT),
             scope_key: meta.scope_key.clone(),
@@ -334,7 +335,8 @@ impl RustRespondService {
             "session_backend": "rust",
             "used_memory": used_memory,
             "used_knowledge": used_knowledge,
-            "knowledge_hit_count": knowledge_context.hit_count,
+            "knowledge_mode": policy.knowledge_mode.as_str(),
+            "knowledge_hit_count": knowledge_hit_count,
             "used_search": used_search,
             "respond_route": respond_route.route.as_str(),
             "route_reason": respond_route.reason,
@@ -446,12 +448,13 @@ impl RustRespondService {
 
         let session_context = build_session_context(&session);
 
-        let knowledge_context = self.knowledge_index.search_context(&user_text)?;
-        let used_knowledge = !knowledge_context.text.trim().is_empty();
         let memory_context = self.build_memory_context(&meta, &user_text)?;
         let used_memory = !memory_context.trim().is_empty();
         let system_prompts = self.prompt_config.load_system_prompts()?;
         let policy = self.resolve_agent_policy(&req)?;
+        let (knowledge_context, knowledge_hit_count) =
+            self.automatic_knowledge_context(policy.knowledge_mode, &user_text)?;
+        let used_knowledge = knowledge_hit_count > 0;
         let dream_context =
             self.memory_dream_context(&req, &meta, policy.resolve_auxiliary_model(None));
         if !policy.enabled {
@@ -479,7 +482,7 @@ impl RustRespondService {
                     message_context: req.message_context.clone(),
                     system_prompts,
                     memory_context,
-                    knowledge_context: knowledge_context.text.clone(),
+                    knowledge_context: knowledge_context.clone(),
                     session_context,
                     history_messages: recent_session_messages(
                         &session,
@@ -536,7 +539,8 @@ impl RustRespondService {
             "session_backend": "rust",
             "used_memory": used_memory,
             "used_knowledge": used_knowledge,
-            "knowledge_hit_count": knowledge_context.hit_count,
+            "knowledge_mode": policy.knowledge_mode.as_str(),
+            "knowledge_hit_count": knowledge_hit_count,
             "used_search": false,
             "respond_route": respond_route.route.as_str(),
             "route_reason": respond_route.reason,
@@ -552,6 +556,24 @@ impl RustRespondService {
             "agent_policy": policy.diagnostic_summary(),
         }));
         Ok(response)
+    }
+
+    /// `tool` 模式完全跳过自动检索；`auto` 只保留为紧急回退。
+    fn automatic_knowledge_context(
+        &self,
+        mode: KnowledgeRetrievalMode,
+        user_text: &str,
+    ) -> Result<(String, usize), LlmError> {
+        if mode == KnowledgeRetrievalMode::Tool {
+            return Ok((String::new(), 0));
+        }
+        let evidence = self.knowledge_index.search_evidence(user_text);
+        reject_failed_knowledge_search(&evidence)?;
+        let hit_count = evidence.diagnostics.returned_chunk_count;
+        Ok((
+            crate::runtime::tools::knowledge::render_context(&evidence),
+            hit_count,
+        ))
     }
 
     /// 从长期记忆存储中读取当前请求可访问的分层记录，组装为系统提示上下文。
@@ -803,6 +825,19 @@ fn is_prompt_extraction_request(text: &str) -> bool {
 
 fn prompt_extraction_refusal() -> &'static str {
     "抱歉，我不能提供系统提示词、开发者指令或内部配置原文。你可以说明想调整的回复风格或行为，我可以按可公开的方式解释和配合。"
+}
+
+fn reject_failed_knowledge_search(
+    evidence: &crate::runtime::tools::knowledge::KnowledgeEvidence,
+) -> Result<(), LlmError> {
+    let Some(failure) = evidence.failure.as_ref() else {
+        return Ok(());
+    };
+    Err(LlmError::new(
+        failure.error_code.clone(),
+        "knowledge search failed",
+        "knowledge",
+    ))
 }
 
 fn policy_source_label(policy: &crate::config::ResolvedAgentPolicy) -> &str {

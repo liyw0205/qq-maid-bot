@@ -6,17 +6,18 @@
 use std::sync::Arc;
 
 use crate::{
-    config::ResolvedAgentPolicy,
+    config::{KnowledgeRetrievalMode, ResolvedAgentPolicy},
     error::LlmError,
     runtime::session::{SessionMeta, SessionRecord, SessionStore},
     runtime::tools::rss::RssFetcher,
     runtime::tools::weather::WEATHER_TOOL_NAME,
     runtime::tools::{
-        CompleteTodoTool, CreateTodoTool, DeleteTodoTool, EditTodoTool, GetTodoTool, ListTodoTool,
-        ManageRecurringReminderTool, MergeTodoTool, RestoreTodoTool, RssManageSubscriptionsTool,
-        RssRecentItemsTool, SaveMemoryTool, TaskStore, TodoScopedToolInputs, ToolTurnPostprocess,
-        TrainScheduleTool, WEB_SEARCH_TOOL_NAME, WeatherTool, WebSearchTimeouts, WebSearchTool,
-        postprocess_tool_turn, replace_scoped_todo_tools_from_visible_snapshot, todo,
+        CompleteTodoTool, CreateTodoTool, DeleteTodoTool, EditTodoTool, GetTodoTool,
+        KnowledgeSearchTool, ListTodoTool, ManageRecurringReminderTool, MergeTodoTool,
+        RestoreTodoTool, RssManageSubscriptionsTool, RssRecentItemsTool, SaveMemoryTool, TaskStore,
+        TodoScopedToolInputs, ToolTurnPostprocess, TrainScheduleTool, WEB_SEARCH_TOOL_NAME,
+        WeatherTool, WebSearchTimeouts, WebSearchTool, postprocess_tool_turn,
+        replace_scoped_todo_tools_from_visible_snapshot, todo,
     },
     storage::notification::NotificationOutboxStore,
 };
@@ -39,6 +40,7 @@ pub(crate) struct ToolRuntime {
 }
 
 impl ToolRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         executors: &RespondExecutors,
         stores: &RespondStores,
@@ -47,6 +49,7 @@ impl ToolRuntime {
         rss_seen_retention: usize,
         tool_result_max_chars: usize,
         web_search_timeouts: WebSearchTimeouts,
+        knowledge_index: crate::runtime::tools::knowledge::KnowledgeIndex,
     ) -> Self {
         let mut registry =
             ToolRegistry::new().with_limits(DEFAULT_TOOL_TIMEOUT, tool_result_max_chars);
@@ -66,6 +69,10 @@ impl ToolRuntime {
                 rss_seen_retention,
             )),
             Arc::new(web_search_tool.clone()),
+            Arc::new(KnowledgeSearchTool::new(
+                knowledge_index,
+                tool_result_max_chars,
+            )),
             Arc::new(ListTodoTool::new(
                 stores.task_store.clone(),
                 stores.session_store.clone(),
@@ -160,6 +167,12 @@ impl ToolRuntime {
         };
         if !self.weather_available {
             tool_names.retain(|name| *name != WEATHER_TOOL_NAME);
+        }
+        if policy.knowledge_mode == KnowledgeRetrievalMode::Auto {
+            // auto 是紧急回退：自动注入时不再向模型暴露同一个检索工具。
+            tool_names.retain(|name| {
+                *name != crate::runtime::tools::knowledge::KNOWLEDGE_SEARCH_TOOL_NAME
+            });
         }
         let mut registry = self.registry.subset(&tool_names)?;
         if tool_names.contains(&WEB_SEARCH_TOOL_NAME) {
