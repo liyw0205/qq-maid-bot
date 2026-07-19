@@ -344,17 +344,113 @@ function Remove-ObsoleteEnvConfig {
     Write-Output "Remove the same keys manually if systemd, Docker, or the host environment still injects them."
 }
 
+function Get-NextAgentConfigBackupPath {
+    param([Parameter(Mandatory = $true)][string]$ConfigFile)
+    $candidate = "${ConfigFile}.old"
+    $suffix = 0
+    while (Test-Path -LiteralPath $candidate) {
+        $suffix++
+        $candidate = "${ConfigFile}.old.${suffix}"
+    }
+    return $candidate
+}
+
+function Replace-AgentConfigFromRelease {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigFile,
+        [Parameter(Mandatory = $true)][string]$TemplateFile
+    )
+    if (-not (Test-Path -LiteralPath $ConfigFile -PathType Leaf)) {
+        throw "Agent config replacement failed: existing file not found: $ConfigFile"
+    }
+    if ((Get-Item -LiteralPath $ConfigFile -Force).LinkType) {
+        throw "Agent config replacement failed: symbolic links are not replaced automatically: $ConfigFile"
+    }
+    if (-not (Test-Path -LiteralPath $TemplateFile -PathType Leaf)) {
+        throw "Agent config replacement failed: Release template not found: $TemplateFile"
+    }
+
+    $directory = Split-Path -Parent $ConfigFile
+    $tempFile = Join-Path $directory (".agent.toml.new." + [Guid]::NewGuid().ToString("N"))
+    $backup = Get-NextAgentConfigBackupPath -ConfigFile $ConfigFile
+    $backupCreated = $false
+    try {
+        Copy-Item -LiteralPath $TemplateFile -Destination $tempFile
+        $templateHash = (Get-FileHash -LiteralPath $TemplateFile -Algorithm SHA256).Hash
+        $tempHash = (Get-FileHash -LiteralPath $tempFile -Algorithm SHA256).Hash
+        if ($templateHash -ne $tempHash) {
+            throw "the new template could not be written completely"
+        }
+
+        Move-Item -LiteralPath $ConfigFile -Destination $backup
+        $backupCreated = $true
+        Move-Item -LiteralPath $tempFile -Destination $ConfigFile
+    } catch {
+        $reason = $_.Exception.Message
+        if ($backupCreated -and -not (Test-Path -LiteralPath $ConfigFile)) {
+            try {
+                Move-Item -LiteralPath $backup -Destination $ConfigFile
+                $backupCreated = $false
+                throw "Agent config replacement failed: $reason; the original file was restored"
+            } catch {
+                if ($backupCreated) {
+                    throw "Agent config replacement failed: $reason; automatic restore failed and the original file remains at $backup"
+                }
+                throw
+            }
+        }
+        throw "Agent config replacement failed: $reason; the original file was not modified"
+    } finally {
+        Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Output "已使用当前 Release 的新版默认配置替换 agent.toml"
+    Write-Output "旧配置备份: $backup"
+    Write-Output "请参考备份重新填写 Provider、模型路线、Scene 和工具白名单等自定义配置。"
+}
+
+function Request-AgentConfigReplacement {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigFile,
+        [Parameter(Mandatory = $true)][string]$TemplateFile,
+        [AllowEmptyString()][string]$Response,
+        [switch]$NonInteractive
+    )
+    if (-not (Test-Path -LiteralPath $ConfigFile)) {
+        return
+    }
+
+    Write-Output "检测到现有 agent.toml，当前版本的配置结构可能已更新。"
+    $responseProvided = $PSBoundParameters.ContainsKey("Response")
+    $inputRedirected = $false
+    try {
+        $inputRedirected = [Console]::IsInputRedirected
+    } catch {
+        $inputRedirected = $true
+    }
+
+    if (-not $responseProvided -and
+        ($NonInteractive -or -not [Environment]::UserInteractive -or $inputRedirected)) {
+        Write-Output "当前为非交互环境，默认保留现有 agent.toml。"
+        Write-Output "旧配置可能不兼容；请手工检查，或在交互终端重新运行 qbot update。"
+        return
+    }
+    if (-not $responseProvided) {
+        $Response = Read-Host "是否使用新版默认配置替换？原文件将备份为 agent.toml.old。[y/N]"
+    }
+    if ($Response -notin @("y", "Y")) {
+        Write-Output "已保留现有 agent.toml；旧配置可能不兼容，请自行检查。"
+        return
+    }
+
+    Replace-AgentConfigFromRelease -ConfigFile $ConfigFile -TemplateFile $TemplateFile
+}
+
 function Install-OrUpdate {
     param([string]$Mode, [string]$RequestedVersion)
     Assert-SupportedWindowsArchitecture (Get-WindowsOperatingSystemArchitecture)
     $version = Resolve-Version $RequestedVersion
     $current = Get-LocalVersion
-    if ($Mode -eq "update" -and $null -ne $current -and (Normalize-Version $current) -eq $version) {
-        Remove-ObsoleteEnvConfig -ConfigFile (Join-Path $script:AppDir "config\.env")
-        Write-Output "already installed: $current"
-        return
-    }
-
     $package = "qq-maid-bot-${version}-windows-x86_64"
     $archiveName = "${package}.zip"
     $tempDir = Join-Path ([IO.Path]::GetTempPath()) ("qbot-install-" + [Guid]::NewGuid())
@@ -369,6 +465,16 @@ function Install-OrUpdate {
         Test-ReleaseChecksum -Archive $archive -ChecksumFile $checksum
         Expand-Archive -LiteralPath $archive -DestinationPath $tempDir -Force
         $releaseDir = Join-Path $tempDir $package
+
+        Request-AgentConfigReplacement `
+            -ConfigFile (Join-Path $script:AppDir "config\agent.toml") `
+            -TemplateFile (Join-Path $releaseDir "config\agent.toml")
+
+        if ($Mode -eq "update" -and $null -ne $current -and (Normalize-Version $current) -eq $version) {
+            Remove-ObsoleteEnvConfig -ConfigFile (Join-Path $script:AppDir "config\.env")
+            Write-Output "already installed: $current"
+            return
+        }
 
         $wasRunning = Test-InstalledBotRunning
         if ($wasRunning) {
