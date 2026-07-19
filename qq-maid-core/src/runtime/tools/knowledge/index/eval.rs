@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::database::SqliteDatabase;
 
-use super::{KnowledgeEvidenceStatus, KnowledgeIndex};
+use super::{KnowledgeEvidenceStatus, KnowledgeIndex, KnowledgeSemanticConfig};
 use crate::runtime::tools::knowledge::storage::{KNOWLEDGE_MIGRATIONS, KnowledgeStore};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -35,6 +35,8 @@ pub struct KnowledgeEvalCase {
     pub category: String,
     pub query: String,
     #[serde(default)]
+    pub additional_queries: Vec<String>,
+    #[serde(default)]
     pub expected_sources: Vec<String>,
     #[serde(default)]
     pub expect_no_hit: bool,
@@ -55,7 +57,11 @@ pub struct KnowledgeEvalMetrics {
     pub source_hit_rate: f64,
     pub no_evidence_accuracy: f64,
     pub low_relevance_injection_rate: f64,
+    pub preflight_injection_accuracy: f64,
+    pub preflight_false_positive_rate: f64,
+    pub preflight_false_negative_rate: f64,
     pub truncated_rate: f64,
+    pub duplicate_rate: f64,
     pub latency_ms_p50: u64,
     pub latency_ms_p95: u64,
 }
@@ -69,6 +75,15 @@ pub struct KnowledgeEvalCaseResult {
     pub retrieved_sources: Vec<String>,
     pub source_recall: f64,
     pub no_evidence_correct: Option<bool>,
+    pub preflight_allowed: bool,
+    pub preflight_expected_allowed: bool,
+    pub preflight_correct: bool,
+    pub evidence_item_count: usize,
+    pub duplicate_count: usize,
+    pub top_lexical_coverage: Option<f64>,
+    pub top_semantic_similarity: Option<f64>,
+    pub injection_reason: String,
+    pub preflight_sources: Vec<String>,
     pub latency_ms: u64,
 }
 
@@ -79,6 +94,7 @@ impl KnowledgeEvalReport {
             && self.metrics.source_hit_rate >= 0.6
             && self.metrics.no_evidence_accuracy >= 1.0
             && self.metrics.low_relevance_injection_rate <= 0.0
+            && self.metrics.preflight_false_positive_rate <= 0.0
     }
 }
 
@@ -91,6 +107,25 @@ pub fn parse_dataset(json: &str) -> Result<KnowledgeEvalDataset, String> {
 
 /// 在隔离的临时索引中运行评测，避免接触或修改真实 `APP_DB_FILE` 和知识目录。
 pub fn run_fts5_baseline(dataset: &KnowledgeEvalDataset) -> Result<KnowledgeEvalReport, String> {
+    run_evaluation(dataset, None, "fts5_bm25")
+}
+
+pub fn run_knowledge_v3(
+    dataset: &KnowledgeEvalDataset,
+    embedding_cache_dir: PathBuf,
+) -> Result<KnowledgeEvalReport, String> {
+    run_evaluation(
+        dataset,
+        Some(KnowledgeSemanticConfig::local(embedding_cache_dir)),
+        "fts5_bm25+local_embedding+rrf",
+    )
+}
+
+fn run_evaluation(
+    dataset: &KnowledgeEvalDataset,
+    semantic: Option<KnowledgeSemanticConfig>,
+    engine: &str,
+) -> Result<KnowledgeEvalReport, String> {
     validate_dataset(dataset)?;
     let workspace = EvalWorkspace::create()?;
     for document in &dataset.documents {
@@ -106,12 +141,24 @@ pub fn run_fts5_baseline(dataset: &KnowledgeEvalDataset) -> Result<KnowledgeEval
         KNOWLEDGE_MIGRATIONS,
     )
     .map_err(|error| error.to_string())?;
-    let index = KnowledgeIndex::new(KnowledgeStore::new(database), &workspace.knowledge_dir);
+    let mut index = KnowledgeIndex::new(KnowledgeStore::new(database), &workspace.knowledge_dir);
+    if let Some(config) = semantic {
+        index = index
+            .with_semantic_config(config)
+            .map_err(|error| error.to_string())?;
+    }
     index.sync().map_err(|error| error.to_string())?;
 
     let mut results = Vec::with_capacity(dataset.cases.len());
     for case in &dataset.cases {
-        let evidence = index.search_evidence(&case.query);
+        let queries = std::iter::once(case.query.clone())
+            .chain(case.additional_queries.iter().cloned())
+            .collect::<Vec<_>>();
+        let evidence = index.search_evidence_many(&queries);
+        let evidence_item_count = evidence.items.len();
+        // 重复率只统计同一 chunk_id 重复返回；同章节的不同补充 chunk 是合法证据。
+        let duplicate_count =
+            duplicate_chunk_id_count(evidence.items.iter().map(|item| item.chunk_id.as_str()));
         let mut retrieved_sources = evidence
             .items
             .iter()
@@ -129,6 +176,16 @@ pub fn run_fts5_baseline(dataset: &KnowledgeEvalDataset) -> Result<KnowledgeEval
         } else {
             matched as f64 / case.expected_sources.len() as f64
         };
+        let preflight = index.search_preflight_evidence(&case.query);
+        let preflight_expected_allowed = !case.expect_no_hit && !case.expected_sources.is_empty();
+        let preflight_allowed = preflight.injection.allow_injection;
+        let mut preflight_sources = preflight
+            .items
+            .iter()
+            .map(|item| item.relative_path.clone())
+            .collect::<Vec<_>>();
+        preflight_sources.sort();
+        preflight_sources.dedup();
         results.push(KnowledgeEvalCaseResult {
             id: case.id.clone(),
             category: case.category.clone(),
@@ -137,15 +194,32 @@ pub fn run_fts5_baseline(dataset: &KnowledgeEvalDataset) -> Result<KnowledgeEval
             retrieved_sources,
             source_recall,
             no_evidence_correct: case.expect_no_hit.then_some(
-                evidence.items.is_empty() && evidence.status == KnowledgeEvidenceStatus::NoHit,
+                evidence.items.is_empty()
+                    && matches!(
+                        evidence.status,
+                        KnowledgeEvidenceStatus::NoHit | KnowledgeEvidenceStatus::LowRelevance
+                    ),
             ),
+            preflight_allowed,
+            preflight_expected_allowed,
+            preflight_correct: preflight_allowed == preflight_expected_allowed,
+            evidence_item_count,
+            duplicate_count,
+            top_lexical_coverage: preflight.diagnostics.top_lexical_coverage,
+            top_semantic_similarity: preflight.diagnostics.top_semantic_similarity,
+            injection_reason: preflight.injection.reason.as_str().to_owned(),
+            preflight_sources,
             latency_ms: evidence.diagnostics.latency_ms,
         });
     }
-    Ok(build_report(dataset.version, results))
+    Ok(build_report(dataset.version, engine, results))
 }
 
-fn build_report(version: u32, cases: Vec<KnowledgeEvalCaseResult>) -> KnowledgeEvalReport {
+fn build_report(
+    version: u32,
+    engine: &str,
+    cases: Vec<KnowledgeEvalCaseResult>,
+) -> KnowledgeEvalReport {
     let evidence_cases = cases
         .iter()
         .filter(|case| !case.expected_sources.is_empty())
@@ -168,25 +242,57 @@ fn build_report(version: u32, cases: Vec<KnowledgeEvalCaseResult>) -> KnowledgeE
     let low_relevance_injection_rate = average(
         no_hit_cases
             .iter()
-            .map(|case| f64::from(!case.retrieved_sources.is_empty())),
+            .map(|case| f64::from(case.preflight_allowed)),
     );
     let truncated_rate = average(
         cases
             .iter()
             .map(|case| f64::from(case.status == KnowledgeEvidenceStatus::Truncated)),
     );
+    let preflight_cases = cases.iter().collect::<Vec<_>>();
+    let preflight_injection_accuracy = average(
+        preflight_cases
+            .iter()
+            .map(|case| f64::from(case.preflight_correct)),
+    );
+    let preflight_false_positive_rate = average(
+        preflight_cases
+            .iter()
+            .filter(|case| !case.preflight_expected_allowed)
+            .map(|case| f64::from(case.preflight_allowed)),
+    );
+    let preflight_false_negative_rate = average(
+        preflight_cases
+            .iter()
+            .filter(|case| case.preflight_expected_allowed)
+            .map(|case| f64::from(!case.preflight_allowed)),
+    );
+    let evidence_item_count = cases
+        .iter()
+        .map(|case| case.evidence_item_count)
+        .sum::<usize>();
+    let duplicate_count = cases.iter().map(|case| case.duplicate_count).sum::<usize>();
+    let duplicate_rate = if evidence_item_count == 0 {
+        0.0
+    } else {
+        duplicate_count as f64 / evidence_item_count as f64
+    };
     let mut latencies = cases.iter().map(|case| case.latency_ms).collect::<Vec<_>>();
     latencies.sort_unstable();
     KnowledgeEvalReport {
         dataset_version: version,
-        engine: "fts5_bm25".to_owned(),
+        engine: engine.to_owned(),
         case_count: cases.len(),
         metrics: KnowledgeEvalMetrics {
             source_recall_at_k,
             source_hit_rate,
             no_evidence_accuracy,
             low_relevance_injection_rate,
+            preflight_injection_accuracy,
+            preflight_false_positive_rate,
+            preflight_false_negative_rate,
             truncated_rate,
+            duplicate_rate,
             latency_ms_p50: percentile(&latencies, 50),
             latency_ms_p95: percentile(&latencies, 95),
         },
@@ -224,6 +330,11 @@ fn validate_dataset(dataset: &KnowledgeEvalDataset) -> Result<(), String> {
             || case.query.trim().is_empty()
             || !ids.insert(case.id.as_str())
             || (case.expect_no_hit && !case.expected_sources.is_empty())
+            || case.additional_queries.len() > 3
+            || case
+                .additional_queries
+                .iter()
+                .any(|query| query.trim().is_empty())
             || case
                 .expected_sources
                 .iter()
@@ -233,6 +344,14 @@ fn validate_dataset(dataset: &KnowledgeEvalDataset) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn duplicate_chunk_id_count<'a>(chunk_ids: impl IntoIterator<Item = &'a str>) -> usize {
+    let mut seen = HashSet::new();
+    chunk_ids
+        .into_iter()
+        .filter(|chunk_id| !seen.insert(*chunk_id))
+        .count()
 }
 
 fn average(values: impl Iterator<Item = f64>) -> f64 {
@@ -294,7 +413,7 @@ mod tests {
         let second = run_fts5_baseline(&dataset).unwrap();
 
         assert_eq!(first.dataset_version, 1);
-        assert_eq!(first.case_count, 6);
+        assert_eq!(first.case_count, 7);
         assert!(first.metrics.source_recall_at_k >= 0.6);
         assert_eq!(first.metrics.no_evidence_accuracy, 1.0);
         assert_eq!(first.metrics.low_relevance_injection_rate, 0.0);
@@ -315,6 +434,15 @@ mod tests {
             first.metrics.low_relevance_injection_rate,
             second.metrics.low_relevance_injection_rate
         );
+        let multi_query = first
+            .cases
+            .iter()
+            .find(|case| case.id == "multi_query_duplicate_recall")
+            .unwrap();
+        assert_eq!(multi_query.source_recall, 1.0);
+        assert_eq!(multi_query.evidence_item_count, 2);
+        assert_eq!(multi_query.duplicate_count, 0);
+        assert_eq!(first.metrics.duplicate_rate, 0.0);
         assert_eq!(
             first
                 .cases
@@ -335,6 +463,18 @@ mod tests {
         dataset.documents[0].path = "../secret.md".to_owned();
 
         assert!(run_fts5_baseline(&dataset).is_err());
+    }
+
+    #[test]
+    fn duplicate_count_uses_complete_chunk_ids() {
+        assert_eq!(
+            duplicate_chunk_id_count(["section:chunk-1", "section:chunk-2", "section:chunk-1"]),
+            1
+        );
+        assert_eq!(
+            duplicate_chunk_id_count(["section:chunk-1", "section:chunk-2"]),
+            0
+        );
     }
 
     fn stable_case_result(
