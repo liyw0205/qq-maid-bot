@@ -1,6 +1,55 @@
 use super::*;
 use qq_maid_llm::web_search::{WebSearchDepth, WebSearchTopic};
 
+struct TestDirectory(std::path::PathBuf);
+
+impl TestDirectory {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "qq-maid-agent-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn first_start_agent_config_matches_embedded_template() {
+    let directory = TestDirectory::new("first-start-content");
+    let path = directory.0.join("config/agent.toml");
+
+    ensure_default_agent_config_at(&HashMap::new(), &path).unwrap();
+
+    assert_eq!(std::fs::read_to_string(path).unwrap(), DEFAULT_AGENT_CONFIG);
+}
+
+#[cfg(unix)]
+#[test]
+fn first_start_agent_config_uses_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TestDirectory::new("first-start-mode");
+    let path = directory.0.join("config/agent.toml");
+
+    ensure_default_agent_config_at(&HashMap::new(), &path).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 #[test]
 fn toml_config_overrides_routes_profiles_and_scenes() {
     let text = r#"
@@ -358,7 +407,7 @@ profile = "balanced"
 
 #[test]
 fn toml_config_rejects_invalid_web_search_backend_and_tavily_options() {
-    let template = include_str!("../../../../runtime/config/agent.toml");
+    let template = include_str!("../../../../runtime/config/agent.example.toml");
     for (current, invalid, field) in [
         (
             "backend = \"provider_native\"",
@@ -432,7 +481,7 @@ profile = "fast"
 
 #[test]
 fn default_agent_toml_prefers_luna_and_keeps_provider_fallbacks() {
-    let text = include_str!("../../../../runtime/config/agent.toml");
+    let text = include_str!("../../../../runtime/config/agent.example.toml");
     let config = AgentRuntimeConfig::from_toml(
         text,
         AgentConfigSource::File("config/agent.toml".to_owned()),
@@ -468,7 +517,7 @@ fn default_agent_toml_prefers_luna_and_keeps_provider_fallbacks() {
 
 #[test]
 fn default_agent_toml_declares_luna_first_without_embedding_secrets() {
-    let text = include_str!("../../../../runtime/config/agent.toml");
+    let text = include_str!("../../../../runtime/config/agent.example.toml");
     let active_config = text
         .lines()
         .map(str::trim)
@@ -495,7 +544,7 @@ fn default_agent_toml_declares_luna_first_without_embedding_secrets() {
 
 #[test]
 fn default_agent_toml_preserves_private_and_group_scene_routes() {
-    let text = include_str!("../../../../runtime/config/agent.toml");
+    let text = include_str!("../../../../runtime/config/agent.example.toml");
     let config = AgentRuntimeConfig::from_toml(
         text,
         AgentConfigSource::File("config/agent.toml".to_owned()),
@@ -550,7 +599,7 @@ fn default_agent_toml_preserves_private_and_group_scene_routes() {
 
 #[test]
 fn default_agent_toml_exposes_expected_luna_first_route_displays() {
-    let text = include_str!("../../../../runtime/config/agent.toml");
+    let text = include_str!("../../../../runtime/config/agent.example.toml");
     let config = AgentRuntimeConfig::from_toml(
         text,
         AgentConfigSource::File("config/agent.toml".to_owned()),
@@ -588,7 +637,7 @@ fn default_agent_toml_exposes_expected_luna_first_route_displays() {
 
 #[test]
 fn toml_config_rejects_unknown_profile() {
-    let text = include_str!("../../../../runtime/config/agent.toml").replacen(
+    let text = include_str!("../../../../runtime/config/agent.example.toml").replacen(
         "profile = \"balanced\"",
         "profile = \"missing\"",
         1,
@@ -606,7 +655,7 @@ fn toml_config_rejects_unknown_profile() {
 
 #[test]
 fn toml_config_rejects_unknown_search_route() {
-    let text = include_str!("../../../../runtime/config/agent.toml").replacen(
+    let text = include_str!("../../../../runtime/config/agent.example.toml").replacen(
         "search_route = \"private_search\"",
         "search_route = \"missing\"",
         1,
@@ -624,7 +673,7 @@ fn toml_config_rejects_unknown_search_route() {
 
 #[test]
 fn toml_config_rejects_unknown_enabled_tool() {
-    let text = include_str!("../../../../runtime/config/agent.toml").replacen(
+    let text = include_str!("../../../../runtime/config/agent.example.toml").replacen(
         "enabled_tools = [\"get_weather\", \"get_train_schedule\"",
         "enabled_tools = [\"run_shell\", \"get_train_schedule\"",
         1,
